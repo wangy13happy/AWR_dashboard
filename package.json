@@ -10,6 +10,7 @@
     "start": "node --no-warnings bin/awr-dashboard.mjs",
     "test": "node --no-warnings --test tests/*.test.mjs",
     "test:browser": "node --no-warnings tests/browser-check.mjs",
+    "test:top-jump": "node --no-warnings tests/top-jump-browser.mjs",
     "test:record": "node --no-warnings tests/run-verification.mjs",
     "test:projects": "node --no-warnings tests/run-project-selection-verification.mjs",
     "test:background": "node --no-warnings tests/run-background-usability-verification.mjs"

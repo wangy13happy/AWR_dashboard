@@ -43,7 +43,11 @@ button:focus-visible, select:focus-visible { outline: 2px solid #2563eb; outline
 .filter[aria-pressed="true"] { box-shadow: inset 0 0 0 1px currentColor; background: #e8efff; }
 .filter-ready[aria-pressed="true"] { background: #ffedc9; }
 .filter-blocked[aria-pressed="true"] { background: #ffe0e6; }
-.refresh-state { display: flex; align-items: center; gap: 6px; color: #6d89aa; font-size: 10px; flex: 0 0 auto; }
+/* 刷新文案会在倒计时、读取中、暂停及失败之间切换。固定预留全部状态所需的空间，
+   防止内容变短时进度条重新伸缩、右侧按钮位移，以及窄屏横滚位置被浏览器钳制。 */
+.refresh-state { display: flex; align-items: center; gap: 6px; color: #6d89aa; font-size: 10px; flex: 0 0 180px; }
+/* 文案本身也占满稳定的剩余空间；数字等宽仅稳定文字内部，不截断状态提示。 */
+.refresh-state #refresh-label { flex: 1; min-width: 0; font-variant-numeric: tabular-nums; }
 .sync-dot { width: 7px; height: 7px; border-radius: 50%; background: #23bd63; flex: 0 0 auto; }
 .sync-dot.loading { background: #528af1; }
 .sync-dot.paused { background: #a7b4c5; }
