@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "userSid": "<本机当前账户的安全标识符>",
+  "nodePath": "<本机 node.exe 的绝对路径>"
+}

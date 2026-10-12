@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AWR 只读依赖进度图</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/vendor/dagre.js" defer></script>
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <header class="toolbar" aria-label="项目进度与图操作">
+      <div class="project-picker">
+        <label for="project-select">项目</label>
+        <select id="project-select" data-testid="project-select" aria-describedby="project-list-count" disabled><option value="">正在读取名单…</option></select>
+        <span id="project-list-count" data-testid="project-list-count">— 项登记</span>
+      </div>
+      <div class="project-heading">
+        <h1 id="project-name" data-testid="project-name">依赖进度图</h1>
+        <span id="project-revision" class="project-revision" data-testid="project-revision">读取中</span>
+        <span class="readonly-badge" title="只读显示，不执行、认领、编辑或重新索引任务">只读</span>
+        <span id="demo-badge" class="demo-badge" data-testid="demo-badge" hidden>演示数据</span>
+      </div>
+      <div class="completion">
+        <div class="completion-label"><span>完成进度</span><span id="completion-label" data-testid="completion-label">—</span></div>
+        <progress id="completion-progress" data-testid="completion-progress" max="1" value="0" aria-label="来源声明完成进度"></progress>
+      </div>
+      <nav class="filters" aria-label="任务状态筛选">
+        <button type="button" class="filter filter-continue" data-filter="continuable" aria-pressed="false" title="有继续工作的记录；不表示你拥有认领"><span class="filter-icon">▶</span>继续 <span data-count="continuable">—</span></button>
+        <button type="button" class="filter filter-ready" data-filter="ready" aria-pressed="false" title="已索引依赖图的领取条件满足；不是执行许可"><span class="filter-icon">☛</span>可领取 <span data-count="ready">—</span></button>
+        <button type="button" class="filter" data-filter="waiting" aria-pressed="false" title="计划或就绪任务尚未满足领取条件，且没有续作记录"><span class="filter-icon">⌛</span>等待 <span data-count="waiting">—</span></button>
+        <button type="button" class="filter filter-blocked" data-filter="blocked" aria-pressed="false"><span class="filter-icon">⊖</span>阻塞 <span data-count="blocked">—</span></button>
+        <button type="button" class="filter" data-filter="completed" aria-pressed="false" title="完成仅为来源声明，不等于通过验收"><span class="filter-icon">✓</span>完成 <span data-count="completed">—</span></button>
+        <button type="button" class="filter" data-filter="in_progress" aria-pressed="false"><span class="filter-icon">◌</span>进行中 <span data-count="inProgress">—</span></button>
+        <button type="button" class="filter" data-filter="pending" aria-pressed="false"><span class="filter-icon">○</span>待办 <span data-count="pending">—</span></button>
+        <button type="button" class="filter" data-filter="cancelled" aria-pressed="false"><span class="filter-icon">×</span>已取消 <span data-count="cancelled">—</span></button>
+      </nav>
+      <div class="refresh-state" data-testid="refresh-state"><span id="sync-dot" class="sync-dot loading"></span><span id="refresh-label">正在读取</span></div>
+      <div class="view-actions">
+        <button type="button" id="pause-button" data-testid="pause-button" aria-pressed="false">暂停</button>
+        <button type="button" id="fit-button" data-testid="fit-button" title="按画布宽度适配依赖图">适应宽度</button>
+        <button type="button" id="actual-button" data-testid="actual-button" title="恢复任务卡的原始大小">1:1</button>
+      </div>
+    </header>
+    <main class="workspace">
+      <section id="graph-viewport" class="graph-viewport" data-testid="graph-viewport" aria-label="依赖图：拖动画布平移，滚轮缩放，点击任务查看详情" tabindex="0">
+        <div id="graph-world" class="graph-world" data-testid="graph-world">
+          <svg id="graph-edges" class="graph-edges" aria-hidden="true"></svg>
+          <div id="graph-cards" class="graph-cards"></div>
+        </div>
+        <div class="banner-stack" aria-live="polite">
+          <p id="project-list-banner" class="banner" data-testid="project-list-banner" hidden></p>
+          <div id="banners" class="banners" data-testid="banners"></div>
+        </div>
+        <div id="empty-state" class="empty-state" data-testid="empty-state"><p>正在读取项目…</p></div>
+      </section>
+      <aside id="detail-panel" class="detail-panel" data-testid="detail-panel" aria-label="所选任务详情">
+        <div id="detail-content"><div class="detail-empty"><p>点击任务查看详情</p><p>此看板只读，不执行或认领任务。</p></div></div>
+      </aside>
+    </main>
+    <footer class="legend" aria-label="任务与连线图例">
+      <span><i class="legend-box completed"></i>已完成</span><span><i class="legend-box in-progress"></i>进行中</span><span><i class="legend-box pending"></i>待办</span><span><i class="legend-box blocked"></i>阻塞</span><span><i class="legend-box cancelled"></i>已取消</span><span><i class="legend-box ready"></i><b class="legend-hand">☛</b>可领取（依赖已满足）</span>
+      <span><i class="legend-line satisfied"></i>依赖已满足</span><span><i class="legend-line"></i>依赖未满足</span><span><i class="legend-line optional"></i>可选依赖</span>
+      <span id="source-label" class="source-label" data-testid="source-label">数据源：本地只读稳定副本 · 完成仅为来源声明</span>
+    </footer>
+  </body>
+</html>

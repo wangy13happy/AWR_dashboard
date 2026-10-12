@@ -1,0 +1,19 @@
+{
+  "name": "awr-dependency-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AWR 0.5.1 外置只读实时依赖进度图看板",
+  "type": "module",
+  "engines": { "node": ">=24.0.0" },
+  "bin": { "awr-dashboard": "bin/awr-dashboard.mjs" },
+  "scripts": {
+    "start": "node --no-warnings bin/awr-dashboard.mjs",
+    "test": "node --no-warnings --test tests/*.test.mjs",
+    "test:browser": "node --no-warnings tests/browser-check.mjs",
+    "test:record": "node --no-warnings tests/run-verification.mjs",
+    "test:projects": "node --no-warnings tests/run-project-selection-verification.mjs",
+    "test:background": "node --no-warnings tests/run-background-usability-verification.mjs"
+  },
+  "dependencies": { "@dagrejs/dagre": "1.1.5", "smol-toml": "1.9.0" },
+  "devDependencies": { "@playwright/test": "1.64.0" }
+}

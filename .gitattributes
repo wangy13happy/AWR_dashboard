@@ -1,0 +1,2 @@
+# Preserve the reviewed source bytes, including PowerShell encoding and line endings.
+* -text

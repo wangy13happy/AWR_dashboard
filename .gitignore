@@ -1,0 +1,23 @@
+# 本机配置与身份绑定：只提交对应的 example 文件。
+/config/projects.json
+/ops/background-settings.json
+
+# 本地依赖、运行数据及验证产物。
+/node_modules/
+/run/
+/verification/
+/test-results/
+/playwright-report/
+*.log
+
+# 项目治理与本机历史属于原项目，不属于可移植产品源码。
+/.awr/
+/ledger/
+/AGENTS.md
+/GOALS.md
+/docs/handoff.md
+/docs/source-baseline.md
+
+# 本地环境及凭据文件不进入源码仓库。
+/.env
+/.env.*
