@@ -29,6 +29,8 @@ typedef struct { STARTUPINFOW startup; void *attributes; } TestStartupInfoEx;
 typedef struct {
     volatile LONG phase;
     volatile LONG error;
+    volatile LONG creation_returned;
+    volatile LONG metadata_published;
     volatile LONG inner_job_inherited;
     volatile LONG root_acquired;
     volatile LONG root_exited;
@@ -103,6 +105,16 @@ static BOOL creation_identity(HANDLE process, FILETIME *created) {
     return GetProcessTimes(process, created, &exited, &kernel, &user);
 }
 
+/** 区分真实等待超时与Windows接口失败；调用方须在等待后立即读取，避免覆盖原始系统错误。 */
+static DWORD wait_error(DWORD result) {
+    if (result == WAIT_TIMEOUT) return ERROR_TIMEOUT;
+    if (result == WAIT_FAILED) {
+        DWORD error = GetLastError();
+        return error != ERROR_SUCCESS ? error : ERROR_INVALID_DATA;
+    }
+    return ERROR_INVALID_DATA;
+}
+
 /** 核验本次已持句柄的固定Node或系统控制台辅助映像；前后核对父仍存活，不凭名称或全机扫描归属。 */
 static BOOL verify_child(const TestApis *apis, HANDLE child, HANDLE parent, HANDLE guard, const FILETIME *parent_created, BOOL *node) {
     WCHAR image[32768];
@@ -173,16 +185,25 @@ static DWORD parent_run(HANDLE port, HANDLE mapping, int mode) {
     startup.attributes = attributes;
     if (_snwprintf(command, sizeof(command) / sizeof(command[0]), L"\"%ls\" \"%ls\" %ls", AWR_NODE_PATH,
         AWR_RUNNER_PATH, mode == 4 ? L"exit-code" : mode == 3 ? L"tree" : L"leaf") < 0) goto cleanup;
-    /* phase=1只说明调用方尚未记录创建返回；不把该观测声称为确定停在内核某条指令。 */
+    /* phase=1只说明调用方尚未发布创建结果；不把该观测声称为确定停在内核某条指令。 */
     InterlockedExchange(&shared->phase, 1);
     created = CreateProcessW(AWR_NODE_PATH, command, NULL, NULL, FALSE,
         CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, NULL, AWR_PROJECT_ROOT,
         &startup.startup, &process);
     if (!created) goto cleanup;
+    InterlockedExchange(&shared->creation_returned, 1);
+    if (mode == 1) {
+        /* 创建已成功返回，但root元数据与phase=2尚未发布。用本夹具明确的阻塞点验证
+         * 这个既有观测边界，避免降低父线程优先级争抢一个偶然调度窗口。
+         * 控制器仍须取得并核验真实子句柄后硬停止父；不声称捕获了内核创建调用中点。 */
+        Sleep(INFINITE);
+        goto cleanup;
+    }
     shared->root_id = process.dwProcessId;
     if (!creation_identity(process.hProcess, &shared->root_creation)) goto cleanup;
+    InterlockedExchange(&shared->metadata_published, 1);
     InterlockedExchange(&shared->phase, 2);
-    if (mode == 1 || mode == 2) {
+    if (mode == 2) {
         /* 控制器只使用已持父句柄硬停止；父不主动关闭内层job以免把正常清理混入硬停止结果。 */
         Sleep(INFINITE);
         goto cleanup;
@@ -215,8 +236,8 @@ cleanup:
     return result;
 }
 
-/** 一个真实窗口尝试：控制器不持内层job，通知有界，身份核对失败则未知并退出，guard仅负责兜底清理。 */
-static int controller_attempt(int mode, int attempt, BOOL *retry) {
+/** 单次真实观测：控制器不持内层job，阶段或身份异常直接失败，guard仅负责兜底清理。 */
+static int controller_run(int mode) {
     TestApis apis;
     HANDLE port = NULL, mapping = NULL, guard = NULL;
     HANDLE children[8] = { NULL };
@@ -232,11 +253,16 @@ static int controller_attempt(int mode, int attempt, BOOL *retry) {
     FILETIME parent_created;
     WCHAR executable[32768], command[32768];
     DWORD start = GetTickCount(), child_count = 0, node_count = 0, parent_exit = 0, child_exit = 0, error = 0;
+    DWORD observation_start = 0, setup_elapsed = 0, observation_elapsed = 0;
+    DWORD child_wait_result = WAIT_FAILED, cleanup_error = ERROR_SUCCESS;
     const char *stage = "setup";
-    LONG observed_phase = 0;
+    const char *primary_stage;
+    DWORD primary_error;
+    LONG observed_phase = 0, creation_returned = 0, metadata_published = 0;
     void *attributes = NULL;
     BOOL stopped = FALSE, success = FALSE, limited = FALSE, active_zero = FALSE;
-    *retry = FALSE;
+    BOOL observation_started = FALSE, observation_finished = FALSE;
+    BOOL cleanup_verified = TRUE;
     memset(&apis, 0, sizeof(apis));
     memset(&parent, 0, sizeof(parent));
     limited = is_limited_parent();
@@ -268,10 +294,12 @@ static int controller_attempt(int mode, int attempt, BOOL *retry) {
     if (!creation_identity(parent.hProcess, &parent_created)) goto cleanup;
     SetHandleInformation(port, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(mapping, HANDLE_FLAG_INHERIT, 0);
-    /* 创建阶段观察使用本次线程调度优先级，仍不保证捕获；未捕获必须重试或明确失败。 */
-    if (mode == 1) { SetThreadPriority(parent.hThread, THREAD_PRIORITY_LOWEST); SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST); }
     if (ResumeThread(parent.hThread) == (DWORD)-1) goto cleanup;
     CloseHandle(parent.hThread); parent.hThread = NULL;
+    observation_start = GetTickCount();
+    setup_elapsed = (DWORD)(observation_start - start);
+    observation_started = TRUE;
+    /* 仍以函数入口起算原10000ms总预算；分阶段计时只增加诊断，不重置或放宽等待上限。 */
     while ((DWORD)(GetTickCount() - start) < 10000) {
         DWORD message = 0;
         ULONG_PTR key = 0;
@@ -298,6 +326,7 @@ static int controller_attempt(int mode, int attempt, BOOL *retry) {
         }
         if (shared->error != 0) { error = (DWORD)shared->error; goto cleanup; }
         observed_phase = InterlockedCompareExchange(&shared->phase, 0, 0);
+        creation_returned = InterlockedCompareExchange(&shared->creation_returned, 0, 0);
         if (node_count != 0 && observed_phase >= 2 && shared->root_acquired == 0) {
             if (node_ids[0] != shared->root_id || CompareFileTime(&node_created[0], &shared->root_creation) != 0) {
                 error = ERROR_INVALID_DATA; goto cleanup;
@@ -310,8 +339,14 @@ static int controller_attempt(int mode, int attempt, BOOL *retry) {
             break;
         }
         if (node_count == (mode == 3 ? 2u : 1u)) {
-            if (mode == 1 && observed_phase != 1) { *retry = TRUE; break; }
-            if ((mode == 1 && observed_phase == 1) || (mode == 2 && observed_phase == 2) || (mode == 3 && observed_phase == 3)) {
+            /* 创建成功后本模式固定停在phase1；其它阶段是协议错误，不能重试掩盖。 */
+            if (mode == 1 && observed_phase != 1) {
+                stage = "creation-phase";
+                error = ERROR_INVALID_DATA;
+                goto cleanup;
+            }
+            if ((mode == 1 && observed_phase == 1 && creation_returned != 0) ||
+                (mode == 2 && observed_phase == 2) || (mode == 3 && observed_phase == 3)) {
                 if (!TerminateProcess(parent.hProcess, 77)) goto cleanup;
                 stopped = TRUE;
                 break;
@@ -319,12 +354,15 @@ static int controller_attempt(int mode, int attempt, BOOL *retry) {
         }
         if (WaitForSingleObject(parent.hProcess, 0) == WAIT_OBJECT_0 && mode != 4) { error = ERROR_PROCESS_ABORTED; goto cleanup; }
     }
-    if (*retry) goto cleanup;
+    observation_elapsed = (DWORD)(GetTickCount() - observation_start);
+    observation_finished = TRUE;
     stage = "window-observation";
     if ((mode != 4 && !stopped) || node_count != (mode == 3 ? 2u : 1u) || shared->inner_job_inherited) { error = ERROR_TIMEOUT; goto cleanup; }
     if (WaitForSingleObject(parent.hProcess, 5000) != WAIT_OBJECT_0 || !GetExitCodeProcess(parent.hProcess, &parent_exit)) goto cleanup;
+    stage = "children-exit";
     for (DWORD index = 0; index < child_count; ++index) {
-        if (WaitForSingleObject(children[index], 5000) != WAIT_OBJECT_0) { error = ERROR_TIMEOUT; goto cleanup; }
+        child_wait_result = WaitForSingleObject(children[index], 5000);
+        if (child_wait_result != WAIT_OBJECT_0) { error = wait_error(child_wait_result); goto cleanup; }
     }
     if (!GetExitCodeProcess(root_child, &child_exit)) goto cleanup;
     /* 内层最后句柄关闭时没有实证收到零通知，不能强求该消息或声称已观察。
@@ -344,14 +382,38 @@ static int controller_attempt(int mode, int attempt, BOOL *retry) {
     success = TRUE;
 cleanup:
     if (!success && error == 0) error = GetLastError() != 0 ? GetLastError() : ERROR_INVALID_DATA;
-    /* 失败只操作本次已持父句柄和guard；不存在按编号、名称或命令全机扫描/终止的补偿路径。 */
+    primary_stage = stage;
+    primary_error = error;
+    /* 在失败兜底清理前固定观测数据；清理等待不能混入setup或observation耗时。 */
+    if (!observation_started) setup_elapsed = (DWORD)(GetTickCount() - start);
+    else if (!observation_finished) observation_elapsed = (DWORD)(GetTickCount() - observation_start);
+    if (shared != NULL) {
+        observed_phase = InterlockedCompareExchange(&shared->phase, 0, 0);
+        creation_returned = InterlockedCompareExchange(&shared->creation_returned, 0, 0);
+        metadata_published = InterlockedCompareExchange(&shared->metadata_published, 0, 0);
+    }
+    /* 失败只操作本次已持父句柄和guard；不存在按编号、名称或命令全机扫描/终止的补偿路径。
+     * 父及各子仍只使用原5000ms清理预算，但确认放在guard关闭后，不能仅凭发出终止就声称已退出。 */
     if (!success && parent.hProcess != NULL && WaitForSingleObject(parent.hProcess, 0) != WAIT_OBJECT_0) {
         TerminateProcess(parent.hProcess, 78);
-        WaitForSingleObject(parent.hProcess, 5000);
     }
-    if (guard != NULL) CloseHandle(guard);
+    if (guard != NULL && !CloseHandle(guard)) {
+        cleanup_error = GetLastError();
+        cleanup_verified = FALSE;
+    }
+    if (parent.hProcess != NULL) {
+        DWORD waited = WaitForSingleObject(parent.hProcess, success ? 0 : 5000);
+        if (waited != WAIT_OBJECT_0) {
+            cleanup_error = wait_error(waited);
+            cleanup_verified = FALSE;
+        }
+    }
     for (DWORD index = 0; index < child_count; ++index) {
-        if (!success) WaitForSingleObject(children[index], 5000);
+        DWORD waited = WaitForSingleObject(children[index], success ? 0 : 5000);
+        if (waited != WAIT_OBJECT_0) {
+            cleanup_error = wait_error(waited);
+            cleanup_verified = FALSE;
+        }
         CloseHandle(children[index]);
     }
     if (parent.hThread != NULL) CloseHandle(parent.hThread);
@@ -360,19 +422,28 @@ cleanup:
     if (shared != NULL) UnmapViewOfFile(shared);
     if (mapping != NULL) CloseHandle(mapping);
     if (port != NULL) CloseHandle(port);
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
-    if (*retry) return 0;
-    if (!success) { fprintf(stderr, "fixture-failed stage=%s mode=%d error=%lu phase=%ld children=%lu parentExit=%lu childExit=%lu\n",
+    /* 原始断言失败与清理失败分开报告；负例不能把未确认清理的超时接受为预期成功。 */
+    if (!cleanup_verified) {
+        success = FALSE;
+        stage = "cleanup-failed";
+        error = cleanup_error != ERROR_SUCCESS ? cleanup_error : ERROR_INVALID_DATA;
+    }
+    if (!success) { fprintf(stderr, "fixture-failed stage=%s mode=%d error=%lu phase=%ld children=%lu parentExit=%lu childExit=%lu creationReturned=%ld metadataPublished=%ld setupElapsedMs=%lu observationElapsedMs=%lu nodeCount=%lu childWaitResult=%lu cleanupVerified=%s primaryStage=%s primaryError=%lu\n",
         stage, mode, (unsigned long)error, (long)observed_phase, (unsigned long)child_count,
-        (unsigned long)parent_exit, (unsigned long)child_exit); return 1; }
+        (unsigned long)parent_exit, (unsigned long)child_exit, (long)creation_returned, (long)metadata_published,
+        (unsigned long)setup_elapsed, (unsigned long)observation_elapsed, (unsigned long)node_count,
+        (unsigned long)child_wait_result, cleanup_verified ? "true" : "false", primary_stage, (unsigned long)primary_error); return 1; }
     printf("{\"evidence\":\"real-job-limited-fixture-not-s4u\",\"pointerBits\":%u,\"limitedParent\":true,"
         "\"childImageVerified\":true,\"creationIdentityVerified\":true,\"parentAliveDuringAcquisition\":true,\"guardOpenDuringAssertions\":true,"
         "\"scopedGuardActiveZero\":true,"
         "\"childrenExited\":true,\"innerJobInherited\":false,\"unknownProcessesScanned\":false,"
-        "\"parentStoppedViaHeldHandle\":%s,\"phase\":%ld,\"childCount\":%lu,\"nodeCount\":%lu,\"systemHelperCount\":%lu,\"attempt\":%d,"
+        "\"parentStoppedViaHeldHandle\":%s,\"phase\":%ld,\"creationReturned\":%s,\"metadataPublished\":%s,\"setupElapsedMs\":%lu,\"observationElapsedMs\":%lu,\"childCount\":%lu,\"nodeCount\":%lu,\"systemHelperCount\":%lu,\"attempt\":1,"
+        "\"childWaitResult\":%lu,\"cleanupVerified\":%s,"
         "\"parentExitCode\":%lu,\"childExitCode\":%lu}\n", (unsigned int)(sizeof(void *) * 8), stopped ? "true" : "false",
-        (long)observed_phase, (unsigned long)child_count, (unsigned long)node_count, (unsigned long)(child_count - node_count),
-        attempt, (unsigned long)parent_exit, (unsigned long)child_exit);
+        (long)observed_phase, creation_returned != 0 ? "true" : "false", metadata_published != 0 ? "true" : "false",
+        (unsigned long)setup_elapsed, (unsigned long)observation_elapsed, (unsigned long)child_count,
+        (unsigned long)node_count, (unsigned long)(child_count - node_count),
+        (unsigned long)child_wait_result, cleanup_verified ? "true" : "false", (unsigned long)parent_exit, (unsigned long)child_exit);
     return 0;
 }
 
@@ -390,11 +461,5 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "waiting") == 0) mode = 3;
     if (strcmp(argv[1], "exit-code") == 0) mode = 4;
     if (mode == 0) return 2;
-    for (int attempt = 1; attempt <= (mode == 1 ? 40 : 1); ++attempt) {
-        BOOL retry;
-        int result = controller_attempt(mode, attempt, &retry);
-        if (result != 0 || !retry) return result;
-    }
-    fprintf(stderr, "fixture-failed creation-phase-not-observed\n");
-    return 1;
+    return controller_run(mode);
 }

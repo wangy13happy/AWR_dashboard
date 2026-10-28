@@ -8,9 +8,15 @@
   "bin": { "awr-dashboard": "bin/awr-dashboard.mjs" },
   "scripts": {
     "start": "node --no-warnings bin/awr-dashboard.mjs",
-    "test": "node --no-warnings --test tests/*.test.mjs",
+    "test": "node --no-warnings --test --test-concurrency=1 tests/*.test.mjs",
     "test:browser": "node --no-warnings tests/browser-check.mjs",
+    "test:favicon": "node --no-warnings tests/favicon-browser.mjs",
     "test:top-jump": "node --no-warnings tests/top-jump-browser.mjs",
+    "test:panel-ui": "node --no-warnings tests/panel-ui-browser.mjs",
+    "test:toolbar-scale": "node --no-warnings tests/toolbar-scale-browser.mjs",
+    "test:revision-width": "node --no-warnings tests/revision-width-browser.mjs",
+    "test:titles": "node --no-warnings tests/title-work-id-browser.mjs",
+    "test:halo": "node --no-warnings tests/card-halo-browser.mjs",
     "test:record": "node --no-warnings tests/run-verification.mjs",
     "test:projects": "node --no-warnings tests/run-project-selection-verification.mjs",
     "test:background": "node --no-warnings tests/run-background-usability-verification.mjs"

@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { createDashboardServer } from '../src/server.js';
 import { readProjectRegistry, normalizedProjectRoot } from '../src/registry.js';
 import { DashboardError } from '../src/safety.js';
+import { createAgentObserver } from '../src/agent-observer.js';
 
 /** 解析本地登记清单与启动默认参数；项目参数只能选择清单内根，不扩大允许名单。 */
 function parseArguments(args) {
@@ -44,7 +45,7 @@ async function main() {
     projectRoot = entry.root;
   }
   // 启动和列名单不检查各项目DB：不可用的单项不得阻止其他已登记项目被选择。
-  const server = createDashboardServer({ registryPath, projectRoot, onError: code => console.error(`看板读取：${code}`) });
+  const server = createDashboardServer({ registryPath, projectRoot, agentObserver: createAgentObserver(), onError: code => console.error(`看板读取：${code}`) });
   server.on('error', error => {
     console.error(error.code === 'EADDRINUSE' ? '启动失败：该端口已被占用，请使用 --port 指定其他端口。' : '启动失败：无法监听本地端口。');
     process.exitCode = 1;

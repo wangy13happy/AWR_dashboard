@@ -4,6 +4,7 @@ import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { setTimeout as delay } from 'node:timers/promises';
 import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, statSync, lstatSync, appendFileSync, realpathSync, openSync, closeSync, fstatSync } from 'node:fs';
 
 const ROOT = realpathSync(fileURLToPath(new URL('../', import.meta.url)));
@@ -12,6 +13,8 @@ const OWNER = 'awr-dashboard-background-v1';
 const LOG_LIMIT = 1024 * 1024;
 const RECORD_LIMIT = 16 * 1024;
 const DIAGNOSTIC_LIMIT = 1024;
+const RECORD_REPLACE_BUDGET_MS = 1000;
+const RECORD_REPLACE_INTERVAL_MS = 50;
 const STARTUP_STAGES = new Set(['platform', 'identity', 'binding', 'identity_binding', 'registry', 'state_paths',
   'record_read', 'server_create', 'listen', 'record_write', 'service_log', 'runtime', 'stopped_log']);
 const STARTUP_CODES = new Set(['BACKGROUND_WINDOWS_REQUIRED', 'BACKGROUND_IDENTITY_FAILED', 'BACKGROUND_BINDING_INVALID',
@@ -203,6 +206,112 @@ export function readInstanceRecord(directory) {
   return value;
 }
 
+/** 比较文件系统对象身份；出生时刻补充编号复用检查，不把路径相同当成同一对象。 */
+function sameFileIdentity(actual, expected) {
+  return actual.dev === expected.dev && actual.ino === expected.ino && actual.birthtimeNs === expected.birthtimeNs;
+}
+
+/** 在监听前保存已校验旧记录及目录的身份基线，监听的异步间隙也不能接管后来出现的记录。 */
+function captureReplacementBaseline(directory, previous) {
+  assertRuntimePaths(directory);
+  const directoryIdentity = lstatSync(directory, { bigint: true });
+  const target = path.join(directory, 'instance.json');
+  let oldIdentity;
+  let oldBytes;
+  if (previous) {
+    oldIdentity = lstatSync(target, { bigint: true });
+    if (oldIdentity.size > BigInt(RECORD_LIMIT)) throw new Error('BACKGROUND_RECORD_INVALID');
+    oldBytes = readFileSync(target);
+    // 监听前已经核对的记录必须仍然相同；等待期间更严格地比较原字节和文件身份。
+    if (JSON.stringify(readInstanceRecord(directory)) !== JSON.stringify(previous)
+      || JSON.stringify(JSON.parse(oldBytes.toString('utf8'))) !== JSON.stringify(previous)
+      || !sameFileIdentity(lstatSync(target, { bigint: true }), oldIdentity)
+      || !readFileSync(target).equals(oldBytes)) throw new Error('BACKGROUND_RECORD_INVALID');
+  }
+  if (!sameFileIdentity(lstatSync(directory, { bigint: true }), directoryIdentity)) throw new Error('BACKGROUND_STATE_LINK');
+  return { directoryIdentity, oldIdentity, oldBytes };
+}
+
+/**
+ * 原子发布新实例记录。Windows只读观察者可能短暂阻止替换已核对的旧记录，
+ * 因而只对该路径的访问拒绝重试；总预算固定为1秒，不延长外层启动或测试期限。
+ * 每次让出执行权后重新核对目录、旧记录和临时文件，未知替代内容不能被覆盖或删除。
+ */
+export async function replaceInstanceRecord(directory, record, previous, baseline = captureReplacementBaseline(directory, previous)) {
+  const { directoryIdentity, oldIdentity, oldBytes } = baseline;
+  const target = path.join(directory, 'instance.json');
+  const temporary = path.join(directory, `instance-${record.instanceId}.tmp`);
+  const bytes = Buffer.from(`${JSON.stringify(record, null, 2)}\n`);
+  let createdIdentity;
+  let descriptor;
+  let recordWritten = false;
+  /** 路径门禁和目录身份同时成立才可继续发布或清理自有临时文件。 */
+  function assertDirectoryIdentity() {
+    assertRuntimePaths(directory);
+    if (!sameFileIdentity(lstatSync(directory, { bigint: true }), directoryIdentity)) throw new Error('BACKGROUND_STATE_LINK');
+  }
+  /** 临时文件必须仍是本次排他创建的单链接普通文件，且完整字节没有被改写。 */
+  function assertTemporaryIdentity() {
+    const item = lstatSync(temporary, { bigint: true });
+    if (!item.isFile() || item.isSymbolicLink() || item.nlink !== 1n || !sameFileIdentity(item, createdIdentity)
+      || item.size !== BigInt(bytes.length) || !readFileSync(temporary).equals(bytes)) throw new Error('BACKGROUND_RECORD_INVALID');
+  }
+  /** 旧记录的存在性、身份及完整字节都必须保持；不接管等待期间出现的新记录。 */
+  function assertPreviousIdentity() {
+    let item;
+    try { item = lstatSync(target, { bigint: true }); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    if (!oldIdentity && !item) return;
+    if (!oldIdentity || !item || !sameFileIdentity(item, oldIdentity) || item.size !== BigInt(oldBytes.length)
+      || !readFileSync(target).equals(oldBytes)) throw new Error('BACKGROUND_RECORD_INVALID');
+  }
+  try {
+    assertDirectoryIdentity();
+    assertPreviousIdentity();
+    descriptor = openSync(temporary, 'wx', 0o600);
+    createdIdentity = fstatSync(descriptor, { bigint: true });
+    writeFileSync(descriptor, bytes);
+    recordWritten = true;
+    closeSync(descriptor);
+    descriptor = undefined;
+    const started = performance.now();
+    let firstFailure;
+    for (;;) {
+      assertDirectoryIdentity();
+      assertTemporaryIdentity();
+      assertPreviousIdentity();
+      // 调度延迟或检查本身耗时也消耗同一预算；超期后不能再尝试一次成功来掩盖持续拒绝。
+      if (firstFailure && performance.now() - started >= RECORD_REPLACE_BUDGET_MS) throw firstFailure;
+      try {
+        renameSync(temporary, target);
+        createdIdentity = undefined;
+        return;
+      } catch (error) {
+        if (process.platform !== 'win32' || !oldIdentity || !['EPERM', 'EACCES'].includes(error.code)) throw error;
+        firstFailure ??= error;
+        const remaining = RECORD_REPLACE_BUDGET_MS - (performance.now() - started);
+        if (remaining <= 0) throw firstFailure;
+        await delay(Math.min(RECORD_REPLACE_INTERVAL_MS, remaining));
+      }
+    }
+  } finally {
+    if (descriptor !== undefined) { try { closeSync(descriptor); } catch { /* 清理不得覆盖最初失败。 */ } }
+    if (createdIdentity) {
+      try {
+        assertDirectoryIdentity();
+        if (recordWritten) assertTemporaryIdentity();
+        else {
+          // 排他创建后的写入也可能只完成一部分；此时按创建句柄身份回收，不能要求完整正文才清理。
+          const item = lstatSync(temporary, { bigint: true });
+          if (!item.isFile() || item.isSymbolicLink() || item.nlink !== 1n
+            || !sameFileIdentity(item, createdIdentity)) throw new Error('BACKGROUND_RECORD_INVALID');
+        }
+        unlinkSync(temporary);
+      } catch { /* 只清理仍可证明属于自己的完整临时文件；未知替代物保留。 */ }
+    }
+  }
+}
+
 /** 获取Windows原生创建时刻和当前用户SID；隐藏的一次性查询不读凭据、不提升权限。 */
 function nativeProcessIdentity() {
   const powershell = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
@@ -272,8 +381,8 @@ export async function runBackground(options) {
     stage = 'registry';
     // 只有实际身份门禁通过才加载业务模块。静态导入会在runBackground之前执行，
     // 因而无法靠函数内的角色检查阻止高角色尝试提前运行工作区模块。
-    const [{ createDashboardServer }, { readProjectRegistry }] = await Promise.all([
-      import('../src/server.js'), import('../src/registry.js'),
+    const [{ createDashboardServer }, { readProjectRegistry }, { createAgentObserver }] = await Promise.all([
+      import('../src/server.js'), import('../src/registry.js'), import('../src/agent-observer.js'),
     ]);
     // 名单验证仍先于身份记录、监听与服务日志；仅授权的安全失败诊断可在失败时单独写入。
     await readProjectRegistry(options.registryPath);
@@ -284,11 +393,12 @@ export async function runBackground(options) {
     stage = 'record_read';
     const previous = readInstanceRecord(options.stateDirectory);
     if (previous && previous.port !== options.port && processExists(previous.pid)) throw new Error('BACKGROUND_STATE_IN_USE');
+    const replacementBaseline = captureReplacementBaseline(options.stateDirectory, previous);
     record = { version: 1, owner: OWNER, projectRoot: ROOT, runnerPath: RUNNER, nodePath: realpathSync(process.execPath),
       registryPath: options.registryPath, port: options.port, pid: process.pid, ...identity, instanceId: randomUUID(), startedAt: new Date().toISOString() };
     instancePath = path.join(options.stateDirectory, 'instance.json');
     stage = 'server_create';
-    server = createDashboardServer({ registryPath: options.registryPath, onError: code => appendBoundedLog(options.stateDirectory, `read.${code}`) });
+    server = createDashboardServer({ registryPath: options.registryPath, agentObserver: createAgentObserver(), onError: code => appendBoundedLog(options.stateDirectory, `read.${code}`) });
     stage = 'listen';
     // 必须先成功独占回环端口才能写instance.json；重复启动失败不覆盖首实例记录、不结束占端口者。
     await new Promise((resolve, reject) => {
@@ -296,9 +406,7 @@ export async function runBackground(options) {
       server.listen({ port: options.port, host: '127.0.0.1', exclusive: true }, resolve);
     });
     stage = 'record_write';
-    const temporaryRecord = path.join(options.stateDirectory, `instance-${record.instanceId}.tmp`);
-    writeFileSync(temporaryRecord, `${JSON.stringify(record, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
-    renameSync(temporaryRecord, instancePath);
+    await replaceInstanceRecord(options.stateDirectory, record, previous, replacementBaseline);
     ownsRecord = true;
     stage = 'service_log';
     appendBoundedLog(options.stateDirectory, 'started', { port: options.port, pid: process.pid });

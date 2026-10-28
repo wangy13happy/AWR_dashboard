@@ -7,11 +7,17 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { parse as parseToml } from 'smol-toml';
 import { DashboardError, hasSensitiveContent, sanitizeText } from './safety.js';
+import { runningWorkIds, evaluateAgentRunning } from './agent-running.js';
+import { assignLanes } from './lanes.js';
 
 const DATABASE_LIMIT = 64 * 1024 * 1024;
 const SOURCE_LIMIT = 8 * 1024 * 1024;
 const APPLICATION_ID = 0x41575231;
-const MIGRATIONS = ['catalog', 'domain', 'search', 'draft_work', 'workstreams', 'workstream_sessions', 'content_reviews'];
+// 0.6.0 的 008–014 仅新增表和索引；读取契约仍逐项检查下方实际使用的列。
+// 只接受完整的两个已核验版本，不把中间迁移状态或未来版本当成兼容。
+const MIGRATIONS = ['catalog', 'domain', 'search', 'draft_work', 'workstreams', 'workstream_sessions', 'content_reviews',
+  'responsibility', 'operation_readset_receipts', 'agent_authorization', 'team_handoff', 'delivery_deps', 'usage_time', 'eta_checkpoints'];
+const SCHEMA_RELEASES = new Map([[7, '0.5.1'], [14, '0.6.0']]);
 const WORK_STATUSES = new Set(['draft', 'planned', 'ready', 'claimed', 'in_progress', 'blocked', 'completed', 'cancelled', 'unknown']);
 // 固定 0.5.1 的已知普通文件适配器；目录适配器不在本看板的已核验范围中。
 const ADAPTERS = new Set(['markdown-heading-v1', 'markdown-rules-v1', 'markdown-ledger-v1', 'yaml-ledger-v1', 'yaml-workstream-ledger-v1']);
@@ -131,6 +137,39 @@ async function boundedRead(filename, limit, captureInput = false, expected = nul
   }
 }
 
+/** 缓存只比较决定里点名的 size 与 mtime。ctime、设备号和 inode 不参与命中。 */
+function fileIdentity(stampValue) {
+  return stampValue ? { size: stampValue.size, mtime: stampValue.mtime } : null;
+}
+
+/** 两个身份都缺席才算相同；一边出现 WAL 或大小/时间变化都要重新双读。 */
+function sameFileIdentity(left, right) {
+  if (left === null || right === null) return left === right;
+  return left.size === right.size && left.mtime === right.mtime;
+}
+
+function sameDatabaseSignature(cached, current) {
+  return !!cached && !!current
+    && sameFileIdentity(cached.db, current.db)
+    && sameFileIdentity(cached.wal, current.wal);
+}
+
+/**
+ * 读取 state.db 与 WAL 的 size+mtime。回滚日志存在时不给出可命中签名，
+ * 随后仍走原来的捕获并拒绝。共享内存不参与双读，也不进签名。
+ */
+async function databaseSignature(root) {
+  const database = path.join(root, '.awr', 'state.db');
+  if (await stamp(root, `${database}-journal`, true)) return null;
+  return {
+    db: fileIdentity(await stamp(root, database, false)),
+    wal: fileIdentity(await stamp(root, `${database}-wal`, true)),
+  };
+}
+
+/** 按项目根记住上次成功快照。只在进程内，不写盘，不跨项目复用。 */
+const snapshotCache = new Map();
+
 /** 双读数据库和 WAL，检查日志存在性与前后身份，不对原库执行 SQLite 操作。 */
 async function captureAttempt(root, options, attempt) {
   const database = path.join(root, '.awr', 'state.db');
@@ -156,7 +195,10 @@ async function captureAttempt(root, options, attempt) {
   const after = await Promise.all(names.map((name) => stamp(root, name, true)));
   if (before.some((item, index) => !sameStamp(item, after[index]))
     || await stamp(root, `${database}-journal`, true)) throw new DashboardError('CAPTURE_CONFLICT', '', true);
-  return images;
+  return {
+    images,
+    signature: { db: fileIdentity(after[0]), wal: fileIdentity(after[1]) },
+  };
 }
 
 /** 单次请求最多重试一次变化冲突；缺文件/拒绝访问返回固定错误。 */
@@ -211,10 +253,11 @@ function parseObject(text) {
   }
 }
 
-/** 固定当前 v7 归属与关键结构；所有检查仅作用于自有副本。 */
+/** 核验已支持版本的归属、完整迁移序列及读取所需列，返回副本中的实际版本。 */
 function validateSchema(db) {
+  const schemaVersion = db.prepare('PRAGMA user_version').get().user_version;
   if (db.prepare('PRAGMA application_id').get().application_id !== APPLICATION_ID
-    || db.prepare('PRAGMA user_version').get().user_version !== 7) throw new DashboardError('UNSUPPORTED_SCHEMA');
+    || !SCHEMA_RELEASES.has(schemaVersion)) throw new DashboardError('UNSUPPORTED_SCHEMA');
   for (const [table, expected] of Object.entries(REQUIRED_COLUMNS)) {
     const object = db.prepare("SELECT type FROM sqlite_master WHERE name=?").get(table);
     if (object?.type !== 'table') throw new DashboardError('UNSUPPORTED_SCHEMA');
@@ -222,9 +265,10 @@ function validateSchema(db) {
     if (expected.some((name) => !actual.has(name))) throw new DashboardError('UNSUPPORTED_SCHEMA');
   }
   const migrations = db.prepare('SELECT version,name FROM schema_migrations ORDER BY version').all();
-  if (migrations.length !== 7 || migrations.some((item, index) => item.version !== index + 1 || item.name !== MIGRATIONS[index])) {
+  if (migrations.length !== schemaVersion || migrations.some((item, index) => item.version !== index + 1 || item.name !== MIGRATIONS[index])) {
     throw new DashboardError('UNSUPPORTED_SCHEMA');
   }
+  return schemaVersion;
 }
 
 /** 创建自有稳定副本并在同一读事务查询；finally 只关闭/清理本轮创建的目录。 */
@@ -240,7 +284,7 @@ async function queryCopy(root, images) {
     if (images[1] !== null) await writeFile(path.join(directory, 'state.db-wal'), images[1], { flag: 'wx', mode: 0o600 });
     db = new DatabaseSync(path.join(directory, 'state.db'), { readOnly: true });
     db.exec('PRAGMA query_only=ON; BEGIN;');
-    validateSchema(db);
+    const schemaVersion = validateSchema(db);
     const projects = db.prepare('SELECT * FROM projects').all();
     if (projects.length !== 1) throw new DashboardError('INCOMPATIBLE_PROJECTION');
     const project = projects[0];
@@ -263,8 +307,47 @@ async function queryCopy(root, images) {
     const edges = db.prepare("SELECT e.* FROM edges e JOIN sources s ON e.source_id=s.id AND e.project_id=s.project_id WHERE e.project_id=? AND e.active=1 AND s.active=1 AND e.from_kind='work_item' AND e.to_kind='work_item' AND e.relation='depends_on' ORDER BY e.from_key,e.to_key,e.id").all(project.id);
     const claims = db.prepare("SELECT * FROM claims WHERE project_id=? AND status='active' AND released_at IS NULL ORDER BY id").all(project.id);
     const evidence = db.prepare('SELECT * FROM evidence WHERE project_id=? AND active=1 AND work_item_id IS NOT NULL ORDER BY id').all(project.id);
+    // 活动信号为可选能力；历史/简化投影缺少会话或事件列时，原图保持可读但不显示动画。
+    let sessions = []; let bindings = []; let resumptions = [];
+    const sessionColumns = new Set(db.prepare('PRAGMA table_info(sessions)').all().map(column => column.name));
+    const eventColumns = new Set(db.prepare('PRAGMA table_info(events)').all().map(column => column.name));
+    if (['id', 'project_id', 'work_item_id', 'status', 'started_at', 'ended_at'].every(name => sessionColumns.has(name))
+      && ['project_id', 'event_type', 'payload_json', 'project_revision'].every(name => eventColumns.has(name))) {
+      try {
+        sessions = db.prepare('SELECT id,work_item_id AS workId,status,started_at AS startedAt,ended_at AS endedAt FROM sessions WHERE project_id=?').all(project.id);
+        const events = db.prepare(`SELECT event_type,payload_json,project_revision FROM events WHERE project_id=?
+          AND event_type IN ('client.bound','client.updated','client.checkpointed','session.resumed','session.resumed_from','session.handoff_received')
+          ORDER BY project_revision LIMIT 20001`).all(project.id);
+        if (events.length > 20000 || sessions.length > 10000) throw new Error('activity_limit');
+        const latest = new Map();
+        for (const event of events) {
+          const payload = JSON.parse(event.payload_json);
+          if (event.event_type.startsWith('client.')) {
+            const b = payload.binding;
+            if (!b || typeof b.client !== 'string' || typeof b.external_session !== 'string' || typeof b.session_id !== 'string') continue;
+            const key = JSON.stringify([b.client, b.external_session]); const previous = latest.get(key);
+            const binding = { client: b.client, externalSession: b.external_session, sessionId: b.session_id };
+            if (!previous || event.project_revision > previous.revision) latest.set(key, { revision: event.project_revision, bindings: [binding] });
+            else if (event.project_revision === previous.revision) previous.bindings.push(binding);
+          } else if (typeof payload.from_session_id === 'string' && typeof payload.to_session_id === 'string') {
+            resumptions.push({ from: payload.from_session_id, to: payload.to_session_id });
+          }
+        }
+        bindings = [...latest.values()].flatMap(item => item.bindings);
+      } catch { sessions = []; bindings = []; resumptions = []; }
+    }
+    // 每项首次/最近活动时刻同样是可选能力：只聚合关联到工作项的事件，不读事件载荷。
+    // work_items.updated_at 是重建投影的时刻，所有工作常常相同，因此不作为时间线依据。
+    let activity = [];
+    if (['project_id', 'work_item_id', 'created_at'].every(name => eventColumns.has(name))) {
+      try {
+        activity = db.prepare(`SELECT work_item_id AS workId, MIN(created_at) AS firstAt, MAX(created_at) AS lastAt, COUNT(*) AS events
+          FROM events WHERE project_id=? AND work_item_id IS NOT NULL GROUP BY work_item_id LIMIT 10001`).all(project.id);
+        if (activity.length > 10000) throw new Error('activity_limit');
+      } catch { activity = []; }
+    }
     db.exec('COMMIT;');
-    return { project, sources, works, edges, claims, evidence };
+    return { project, sources, works, edges, claims, evidence, schemaVersion, sessions, bindings, resumptions, activity };
   } catch (error) {
     if (error instanceof DashboardError) throw error;
     throw new DashboardError('INVALID_DATABASE');
@@ -596,6 +679,19 @@ function attachEvidence(rows, works) {
   }
 }
 
+/** 按工作标识写入活动时间范围；异常行整体放弃时间线，不让单行坏值伪造先后顺序。 */
+function attachActivity(rows, works) {
+  const byId = new Map([...works.values()].filter((work) => !work.missing).map((work) => [work.id, work]));
+  for (const work of works.values()) work.activity = null;
+  const valid = rows.every((row) => typeof row.workId === 'string' && Number.isSafeInteger(row.firstAt) && Number.isSafeInteger(row.lastAt)
+    && row.firstAt >= 0 && row.firstAt <= row.lastAt && Number.isSafeInteger(row.events) && row.events > 0);
+  if (!valid) return;
+  for (const row of rows) {
+    const work = byId.get(row.workId);
+    if (work) work.activity = { firstAt: row.firstAt, lastAt: row.lastAt, events: row.events };
+  }
+}
+
 /** 判定真正环成员：对每个必要闭包起点寻找返回自身路径，不把后续节点当环成员。 */
 function cycleMembers(works) {
   const members = new Set();
@@ -697,10 +793,45 @@ function snapshotValue(root, data, sourceInfo, works, edges, evaluatedAt) {
     diagnostics.push(diagnostic('sensitive_content_withheld', null, 'dashboard'));
   }
   return { version: 1, project: { id: data.project.id, name: sanitizeText(data.project.name), root,
-    awrVersion: '0.5.1', schemaVersion: 7 }, revision: data.project.project_revision,
+    awrVersion: SCHEMA_RELEASES.get(data.schemaVersion), schemaVersion: data.schemaVersion }, revision: data.project.project_revision,
     sourceFingerprint: sourceInfo.sourceFingerprint, updatedAt: Date.now(), evaluatedAt,
     readOnly: true, mode: 'live', sources: sourceInfo.sources, nodes,
     edges: edges.map(({ current, ...edge }) => edge), counts: countWorks(works), diagnostics };
+}
+
+/**
+ * 编号分组在缓存之外计算：缓存只按数据库签名失效，而覆盖来自本看板登记清单，
+ * 清单修改后即使数据库未变，下一次读取也必须采用新的分组名称与合并规则。
+ */
+function withLanes(snapshot, overrides) {
+  snapshot.lanes = assignLanes(snapshot.nodes, overrides ?? {});
+  return snapshot;
+}
+
+/**
+ * 取出光环判定所需的库内行：会话、绑定、续接边，以及每个非缺失工作的资格字段。
+ * 快照节点会剥掉 current/hidden，所以这些字段单独随缓存保存，命中时无需重读库。
+ */
+function agentActivityInput(data, works) {
+  return { sessions: data.sessions, bindings: data.bindings, resumptions: data.resumptions,
+    works: [...works.values()].filter((work) => !work.missing)
+      .map(({ id, key, status, current, hidden }) => ({ id, key, status, current, hidden })) };
+}
+
+/**
+ * 按本次原生观察和本次时间写入每个节点的 agentRunningUntil。
+ * 光环由服务后台观察驱动而不是由库驱动，所以真实捕获和缓存命中都走这里；
+ * 请求仅消费服务后台最近的完整观察，这里不启动进程、不读取原生日志或runner文件。
+ */
+function attachAgentRunning(nodes, activity, options) {
+  const observation = options.agentObservationProvider?.() ?? options.agentObservation ?? null;
+  const now = integer(typeof options.now === 'function' ? options.now() : options.now ?? Date.now());
+  const running = runningWorkIds({ sessions: activity.sessions, bindings: activity.bindings, resumptions: activity.resumptions, observation, now });
+  const eligible = new Map(activity.works.map((work) => [work.key, work]));
+  for (const node of nodes) {
+    const work = eligible.get(node.key);
+    node.agentRunningUntil = work ? evaluateAgentRunning({ work, running, observation, now }) : null;
+  }
 }
 
 /**
@@ -715,16 +846,35 @@ export async function readSnapshot(projectRoot, options = {}) {
     if (normalizedPath(root) !== normalizedPath(resolved)) throw new DashboardError('PROJECT_UNAVAILABLE');
     await ensureLocalPath(root, root, false);
     const evaluatedAt = integer(typeof options.now === 'function' ? options.now() : options.now ?? Date.now());
-    const images = await captureDatabase(root, options);
-    const data = await queryCopy(root, images);
+    const cacheId = normalizedPath(root);
+    // 捕获钩子只给冲突夹具；带钩子时不读缓存，也不把夹具中途改写的结果写进缓存。
+    if (!options.onCaptureStep) {
+      const current = await databaseSignature(root);
+      const cached = snapshotCache.get(cacheId);
+      if (sameDatabaseSignature(cached?.signature, current)) {
+        // 命中只跳过读盘与查询；光环期限仍按缓存的库内行和本次观察重算，不随库签名冻结；分组在重算之后按本看板清单计算。
+        const snapshot = structuredClone(cached.snapshot);
+        attachAgentRunning(snapshot.nodes, cached.activity, options);
+        return withLanes(snapshot, options.laneOverrides);
+      }
+    }
+    const captured = await captureDatabase(root, options);
+    const data = await queryCopy(root, captured.images);
     const sourceInfo = await inspectSources(root, data.sources);
     validateProjectionSources(data, sourceInfo);
     const works = buildWorks(data.works, sourceInfo);
     const edges = buildEdges(data.edges, works, sourceInfo);
     attachClaims(data.claims, works, evaluatedAt);
     attachEvidence(data.evidence, works);
+    attachActivity(data.activity, works);
     deriveReadiness(works, edges, sourceInfo);
-    return snapshotValue(root, data, sourceInfo, works, edges, evaluatedAt);
+    const activity = agentActivityInput(data, works);
+    const snapshot = snapshotValue(root, data, sourceInfo, works, edges, evaluatedAt);
+    attachAgentRunning(snapshot.nodes, activity, options);
+    if (!options.onCaptureStep) {
+      snapshotCache.set(cacheId, { signature: captured.signature, snapshot: structuredClone(snapshot), activity });
+    }
+    return withLanes(snapshot, options.laneOverrides);
   } catch (error) {
     if (error instanceof DashboardError) throw error;
     throw new DashboardError('SNAPSHOT_UNAVAILABLE', '', ['ENOENT', 'EACCES', 'EBUSY'].includes(error.code));

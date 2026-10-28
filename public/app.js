@@ -7,6 +7,28 @@ const CARD_HEIGHT = 72;
 const STATUS_LABELS = { completed: "已完成", in_progress: "进行中", pending: "待办", blocked: "阻塞", cancelled: "已取消", archived: "已归档", unknown: "未知" };
 const COUNT_FIELDS = ["total", "completed", "inProgress", "pending", "blocked", "cancelled", "archived", "unknown", "ready", "continuable", "waiting"];
 const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
+const DETAIL_WIDTH_KEY = "awrDashboardDetailWidth";
+const DETAIL_MIN_WIDTH = 320;
+const DETAIL_MAX_WIDTH = 720;
+const DAY_MS = 86400000;
+// 泳道时间线的固定排版尺寸（像素）。日宽按画布宽度在上下限之间自适应，其余尺寸固定，
+// 五秒刷新时同一数据得到同一坐标，不会让任务卡或滚动位置跳动。
+// 任务卡固定宽高，标题最多两行；卡片从首次活动日开始，顶部色条长度为首次到最近活动的真实跨度。
+const TIMELINE = Object.freeze({ labelWidth: 220, axisHeight: 34, cardWidth: 208, cardHeight: 58, rowGap: 8, lanePadding: 10,
+  undatedWidth: 232, minDayWidth: 44, maxDayWidth: 160, minBarWidth: 6, staleDays: 7 });
+// 编号分组配色：按泳道顺序循环取色，时间线、总览与依赖图分组框用同一颜色；零散任务与缺少的任务用灰与粉。
+const LANE_COLORS = ["#3f6fd8", "#16a07a", "#c2662d", "#8a4fd0", "#d1477a", "#2a93b8", "#9a8a1f", "#5b6bd6", "#c0392b", "#2e8b57"];
+const SCATTERED_COLOR = "#8a9ab0";
+const MISSING_COLOR = "#d58a9a";
+// 旧版看板即改版前的依赖图：原分层坐标、无分组框、无总览。
+const VIEWS = ["timeline", "graph", "classic"];
+const VIEW_KEY = "awrDashboardView";
+const OVERVIEW_KEY = "awrDashboardOverviewCollapsed";
+// 总览“近期活动”的窗口与停滞阈值同为7天；只影响展示分组，不改变任何计数口径。
+const RECENT_DAYS = 7;
+// 依赖图分组框：标题行高、框内边距、框间距与框内同列卡片行距。
+const GRAPH_LANE = Object.freeze({ header: 30, padding: 14, gap: 28, rowGap: 16 });
+const MISSING_LANE_KEY = "~missing";
 const ui = {
   projectSelect: document.getElementById("project-select"), projectListCount: document.getElementById("project-list-count"),
   projectListBanner: document.getElementById("project-list-banner"),
@@ -16,24 +38,38 @@ const ui = {
   refreshLabel: document.getElementById("refresh-label"), syncDot: document.getElementById("sync-dot"),
   pause: document.getElementById("pause-button"), fit: document.getElementById("fit-button"), actual: document.getElementById("actual-button"),
   viewport: document.getElementById("graph-viewport"), world: document.getElementById("graph-world"),
-  edges: document.getElementById("graph-edges"), cards: document.getElementById("graph-cards"),
+  edges: document.getElementById("graph-edges"), cards: document.getElementById("graph-cards"), graphLanes: document.getElementById("graph-lanes"),
   banners: document.getElementById("banners"), empty: document.getElementById("empty-state"),
   details: document.getElementById("detail-content"), source: document.getElementById("source-label"),
+  workspace: document.querySelector(".workspace"), detailPanel: document.getElementById("detail-panel"), detailResizer: document.getElementById("detail-resizer"),
+  canvasArea: document.getElementById("canvas-area"), viewSwitch: document.querySelector(".view-switch"),
+  timelineScroll: document.getElementById("timeline-scroll"), timelineCanvas: document.getElementById("timeline-canvas"),
+  overview: document.getElementById("overview"), overviewSummary: document.getElementById("overview-summary"),
+  overviewToggle: document.getElementById("overview-toggle"), overviewLanes: document.getElementById("overview-lanes"),
+  overviewStale: document.getElementById("overview-stale"), overviewRecent: document.getElementById("overview-recent"),
+  overviewStaleTitle: document.getElementById("overview-stale-title"), overviewRecentTitle: document.getElementById("overview-recent-title"),
 };
 const state = {
-  snapshot: null, nodes: new Map(), positions: new Map(), graphSize: { width: 0, height: 0 }, signature: "",
-  selectedKey: null, selectionRemoved: false, filter: "all", x: 0, y: 0, scale: 1, viewMode: "fit", fitted: false,
+  snapshot: null, nodes: new Map(), positions: new Map(), graphSize: { width: 0, height: 0 }, graphLanes: [], graphLayouts: null, signature: "",
+  selectedKey: null, focusKey: null, selectionRemoved: false, filter: "all", x: 0, y: 0, scale: 1, viewMode: "fit", fitted: false,
   paused: false, inFlight: null, requestSerial: 0, nextRefreshAt: Date.now(), lastSuccessAt: null,
-  failure: null, demoSeen: false, drag: null, timer: null, resizeObserver: null,
+  failure: null, demoSeen: false, drag: null, dragMoved: false, timer: null, resizeObserver: null,
   projects: null, registryMode: null, registryRevision: null, registryGeneration: 0, defaultProjectId: null,
   selectedProjectId: null, projectGeneration: 0, selectionInitialized: false, noProjectReason: null,
   projectsFailure: null, projectsInFlight: null, projectsRequestSerial: 0, nextProjectsRefreshAt: Date.now(),
   projectErrors: new Map(), projectOptionsSignature: "", snapshotRegistryRevision: null, pageInactive: false,
+  detailWidth: null, detailDrag: null,
+  view: "timeline", timelineLayout: null, timelineScrolled: false, overviewCollapsed: false, overviewVisible: false,
 };
 
 /** 把接口文字作为纯文本取得，缺省内容永远不会显示成 undefined。 */
 function text(value, fallback = "") {
   return typeof value === "string" ? value : fallback;
+}
+
+/** 所有任务共用可读标题；只判断空白，不改写完整标题、身份键或安全占位。 */
+function taskTitle(node) {
+  return node.title.trim() ? node.title : node.key;
 }
 
 /** 创建普通元素；所有来源文字经 textContent 写入，不拼接 HTML。 */
@@ -110,8 +146,11 @@ function clearProjectView() {
   state.nodes = new Map();
   state.positions = new Map();
   state.graphSize = { width: 0, height: 0 };
+  state.graphLanes = [];
+  state.graphLayouts = null;
   state.signature = "";
   state.selectedKey = null;
+  state.focusKey = null;
   state.selectionRemoved = false;
   state.filter = "all";
   state.x = 0; state.y = 0; state.scale = 1; state.viewMode = "fit"; state.fitted = false;
@@ -122,15 +161,21 @@ function clearProjectView() {
   state.drag = null;
   ui.viewport.classList.remove("is-dragging");
   ui.cards.replaceChildren();
+  ui.graphLanes.replaceChildren();
   ui.edges.replaceChildren();
   ui.edges.setAttribute("width", "0");
   ui.edges.setAttribute("height", "0");
   ui.world.style.width = "0px"; ui.world.style.height = "0px";
+  ui.timelineCanvas.replaceChildren();
+  ui.timelineCanvas.style.width = "0px"; ui.timelineCanvas.style.height = "0px";
+  state.timelineLayout = null;
+  state.timelineScrolled = false;
   applyTransform();
   renderHeader();
   renderDetails();
   renderBanners();
   renderEmpty();
+  renderOverview();
 }
 
 /** 原生选择框始终列出全部登记项；只在已实际失败后标记条目，不宣称未探测项目可用。 */
@@ -322,13 +367,33 @@ function validateSnapshot(snapshot) {
       throw new Error("依赖快照不完整，未替换已有画面。");
     }
   }
+  // 活动时间与编号分组是新增的可选字段；旧快照缺省时时间线显示说明，依赖图照常可用。
+  for (const node of snapshot.nodes) {
+    const activity = node.activity;
+    if (activity !== undefined && activity !== null && (!Number.isSafeInteger(activity.firstAt) || !Number.isSafeInteger(activity.lastAt)
+        || activity.firstAt > activity.lastAt || !Number.isSafeInteger(activity.events))) throw new Error("活动时间不兼容，未替换已有画面。");
+  }
+  if (snapshot.lanes !== undefined) {
+    if (!Array.isArray(snapshot.lanes)) throw new Error("编号分组不兼容，未替换已有画面。");
+    const grouped = new Set();
+    for (const lane of snapshot.lanes) {
+      if (!lane || typeof lane.key !== "string" || typeof lane.label !== "string" || !Array.isArray(lane.workKeys)
+          || typeof lane.scattered !== "boolean" || !lane.counts?.progress) throw new Error("编号分组不兼容，未替换已有画面。");
+      // 每个工作只能属于一个分组，且必须是本快照里的节点。
+      for (const key of lane.workKeys) {
+        if (!keys.has(key) || grouped.has(key)) throw new Error("编号分组不兼容，未替换已有画面。");
+        grouped.add(key);
+      }
+    }
+  }
 }
 
-/** 仅根据节点与依赖拓扑决定是否重新布局，状态和认领变化不会移动卡片。 */
+/** 仅根据节点、依赖拓扑与分组成员决定是否重新布局，状态和认领变化不会移动卡片。 */
 function topologySignature(snapshot) {
   const nodes = snapshot.nodes.map((node) => node.key).sort();
   const edges = snapshot.edges.map((edge) => [edge.id, edge.from, edge.to, edge.required]).sort(compareEdgeEntries);
-  return JSON.stringify([nodes, edges]);
+  const lanes = (snapshot.lanes || []).map((lane) => [lane.key, [...lane.workKeys].sort()]);
+  return JSON.stringify([nodes, edges, lanes]);
 }
 
 /** 用稳定的完整边标识排序，避免数据库返回行次序影响拓扑签名。 */
@@ -348,7 +413,10 @@ function emptyEdgeLabel() {
 
 /** 复用本地 Dagre 生成左到右分层坐标；空图不伪造任何演示节点。 */
 function calculateLayout(snapshot) {
-  if (!snapshot.nodes.length) return { positions: new Map(), size: { width: 0, height: 0 } };
+  if (!snapshot.nodes.length) {
+    const empty = { positions: new Map(), size: { width: 0, height: 0 }, lanes: [] };
+    return { grouped: empty, classic: empty };
+  }
   if (!window.dagre) throw new Error("本地布局资源未加载，请刷新页面。");
   const graph = new window.dagre.graphlib.Graph({ multigraph: true });
   graph.setGraph({ rankdir: "LR", ranksep: 88, nodesep: 16, edgesep: 8, marginx: 0, marginy: 0 });
@@ -362,7 +430,76 @@ function calculateLayout(snapshot) {
     if (!Number.isFinite(position?.x) || !Number.isFinite(position?.y)) throw new Error("依赖布局失败，未替换已有画面。");
     positions.set(node.key, { x: position.x, y: position.y });
   }
-  return { positions, size: { width: graph.graph().width, height: graph.graph().height } };
+  // 同一次分层结果给出两套坐标：依赖图按编号分组分带，旧版看板沿用原分层坐标且不画框。
+  const size = { width: graph.graph().width, height: graph.graph().height };
+  return { grouped: groupedLayout(snapshot, positions, size), classic: { positions, size, lanes: [] } };
+}
+
+/** 按当前视图选用分组坐标或旧版原坐标；卡片、连线、适应宽度与定位都读这一套。 */
+function applyGraphLayout() {
+  const layout = state.graphLayouts?.[state.view === "classic" ? "classic" : "grouped"];
+  if (!layout) return;
+  state.positions = layout.positions;
+  state.graphSize = layout.size;
+  state.graphLanes = layout.lanes;
+}
+
+/**
+ * 依赖图按编号分组分带：保留分层布局的列坐标，依赖仍从左到右；每个分组成为一条互不重叠的横带，
+ * 顺序与时间线泳道一致，带内同列卡片按原分层次序上下排开。缺少任务的占位节点不属于任何分组，放在最后一带。
+ * 只有一个分组时不画框，沿用原分层坐标。
+ */
+function groupedLayout(snapshot, positions, size) {
+  const lanes = (snapshot.lanes || []).map((lane) => ({ key: lane.key, label: lane.label, scattered: lane.scattered, keys: lane.workKeys }));
+  const grouped = new Set(lanes.flatMap((lane) => lane.keys));
+  const rest = snapshot.nodes.filter((node) => !grouped.has(node.key)).map((node) => node.key).sort();
+  if (rest.length) lanes.push({ key: MISSING_LANE_KEY, label: "缺少的任务", missing: true, keys: rest });
+  if (lanes.length < 2) return { positions, size, lanes: [] };
+  const { header, padding, gap, rowGap } = GRAPH_LANE;
+  const result = new Map();
+  const frames = [];
+  let top = 0;
+  for (const lane of lanes) {
+    const columns = new Map();
+    for (const key of lane.keys) {
+      const { x, y } = positions.get(key);
+      if (!columns.has(x)) columns.set(x, []);
+      columns.get(x).push({ key, y });
+    }
+    let rows = 0;
+    for (const [x, items] of columns) {
+      items.sort((left, right) => left.y - right.y || left.key.localeCompare(right.key));
+      items.forEach((item, row) => result.set(item.key, { x: x + padding, y: top + header + row * (CARD_HEIGHT + rowGap) + CARD_HEIGHT / 2 }));
+      rows = Math.max(rows, items.length);
+    }
+    const xs = [...columns.keys()];
+    const left = Math.min(...xs) - CARD_WIDTH / 2;
+    const height = header + rows * CARD_HEIGHT + (rows - 1) * rowGap + padding;
+    frames.push({ key: lane.key, label: lane.label, scattered: Boolean(lane.scattered), missing: Boolean(lane.missing), keys: lane.keys,
+      x: left, y: top, width: Math.max(...xs) - Math.min(...xs) + CARD_WIDTH + padding * 2, height });
+    top += height + gap;
+  }
+  return { positions: result, size: { width: size.width + padding * 2, height: top - gap }, lanes: frames };
+}
+
+/** 分组框只是底层背景：标题写分组名与完成数，状态变化随每次渲染更新，不移动卡片。 */
+function laneFrame(frame, color) {
+  const box = element("div", "graph-lane");
+  box.style.setProperty("--lane-color", color);
+  box.dataset.laneFrame = frame.key;
+  box.dataset.testid = "graph-lane";
+  box.classList.toggle("is-scattered", frame.scattered);
+  box.classList.toggle("is-missing", frame.missing);
+  box.style.left = `${frame.x}px`;
+  box.style.top = `${frame.y}px`;
+  box.style.width = `${frame.width}px`;
+  box.style.height = `${frame.height}px`;
+  const done = frame.keys.filter((key) => state.nodes.get(key)?.status === "completed").length;
+  const title = element("div", "graph-lane-title");
+  title.append(element("span", "graph-lane-label", frame.label), element("span", "graph-lane-count", frame.missing ? `${frame.keys.length} 项` : `${done}/${frame.keys.length} 完成`));
+  title.title = frame.missing ? "依赖指向的任务在来源中不存在" : frame.scattered ? "编号不成组或无编号的任务" : "按编号前缀自动分组，不代表业务归属";
+  box.append(title);
+  return box;
 }
 
 /** 按依赖起点、终点和标识稳定排序，可选依赖也保留其真实连线。 */
@@ -386,11 +523,13 @@ function acceptSnapshot(snapshot) {
   if (projectChanged) clearProjectView();
   state.selectionRemoved = Boolean(state.selectedKey && !nextNodes.has(state.selectedKey));
   if (state.selectionRemoved) state.selectedKey = null;
+  // 高亮的任务不在新快照里时同样解除高亮，不提示；详情栏的“原选任务已不在”提示只跟随选中。
+  if (state.focusKey && !nextNodes.has(state.focusKey)) state.focusKey = null;
   state.snapshot = snapshot;
   state.snapshotRegistryRevision = state.registryRevision;
   state.nodes = nextNodes;
   state.signature = signature;
-  if (layout) { state.positions = layout.positions; state.graphSize = layout.size; }
+  if (layout) { state.graphLayouts = layout; applyGraphLayout(); }
   state.lastSuccessAt = snapshot.updatedAt;
   state.failure = null;
   state.projectErrors.delete(state.selectedProjectId);
@@ -398,6 +537,8 @@ function acceptSnapshot(snapshot) {
   state.demoSeen ||= snapshot.mode === "demo";
   renderHeader();
   renderGraph();
+  renderOverview();
+  renderTimeline();
   renderDetails();
   renderBanners();
   renderEmpty();
@@ -464,7 +605,7 @@ function edgePath(edge) {
 }
 
 /** 创建固定尺寸任务卡，来源内容只做纯文本和完整标题提示。 */
-function createCard(node) {
+function createCard(node, related = null) {
   const button = element("button", `task-card status-${node.status}`);
   button.type = "button";
   button.dataset.nodeKey = node.key;
@@ -476,16 +617,14 @@ function createCard(node) {
   button.classList.toggle("is-ready", node.ready);
   button.classList.toggle("is-missing", node.missing === true);
   button.classList.toggle("is-dimmed", !matchesFilter(node));
+  applyFocus(button, node.key, related);
   const position = state.positions.get(node.key);
   button.style.left = `${position.x - CARD_WIDTH / 2}px`;
   button.style.top = `${position.y - CARD_HEIGHT / 2}px`;
-  const heading = element("span", "card-heading");
-  heading.append(element("span", "card-key", node.key));
-  const meta = [text(node.priority), text(node.kind)].filter(Boolean).join(" · ");
-  heading.append(element("span", "card-meta", meta));
-  button.append(heading, element("span", "card-title", node.title));
+  // 卡片只呈现名称；完整编号仍保留在数据属性、悬停说明和辅助阅读标签中。
+  button.append(element("span", "card-title", taskTitle(node)));
   const footer = element("span", "card-state");
-  footer.append(element("span", "", node.missing ? "缺少任务" : STATUS_LABELS[node.status]));
+  footer.append(element("span", "card-status", node.missing ? "缺少任务" : STATUS_LABELS[node.status]));
   if (node.claims.length) {
     const icon = element("span", "claim-icon", "♟");
     icon.title = "存在有效认领；分支和负责人见详情，不表示你拥有认领";
@@ -497,9 +636,55 @@ function createCard(node) {
     const warning = element("span", "card-warning", "!");
     warning.title = warnings.map((diagnostic) => text(diagnostic.code)).join("，");
     footer.append(warning);
-  } else if (node.status === "in_progress") footer.append(element("span", "running-dot"));
+  }
+  if (node.status === "in_progress") {
+    // 进行中卡片始终保留同一活动槽；真实运行信号只增加覆盖层，不改变名称、状态及元数据宽度。
+    const slot = element("span", "card-activity");
+    slot.setAttribute("aria-hidden", "true");
+    if (!warnings.length) slot.append(element("span", "running-dot"));
+    if (Number.isSafeInteger(node.agentRunningUntil) && node.agentRunningUntil > Date.now()) {
+      const activity = element("span", "agent-running-icon");
+      activity.dataset.validUntil = String(node.agentRunningUntil);
+      slot.append(activity);
+    }
+    footer.append(slot);
+  }
+  // 元数据放在状态行最右侧，仅此文字可收缩省略，状态与图标保持可见。
+  const meta = [text(node.priority), text(node.kind)].filter(Boolean).join(" · ");
+  footer.append(element("span", "card-meta", meta));
   button.append(footer);
   return button;
+}
+
+/**
+ * 高亮任务的关联集合：自身与直接上游、直接下游（含可选依赖）。没有高亮时返回 null，表示不做聚焦。
+ * 高亮由双击设置，与单击决定的详情选中分开：三个视图共用，集合内卡片突出，其余渐隐；与高亮任务相连的连线加粗。
+ */
+function relatedKeys() {
+  const focused = state.focusKey;
+  if (!focused || !state.nodes.has(focused)) return null;
+  const keys = new Set([focused]);
+  for (const edge of state.snapshot?.edges ?? []) {
+    if (edge.from === focused) keys.add(edge.to);
+    if (edge.to === focused) keys.add(edge.from);
+  }
+  return keys;
+}
+
+/**
+ * 按关联集合给卡片或任务卡打上突出/渐隐标记。
+ * 正在看详情的卡片由 is-selected 表示，既不加关联光圈也不渐隐，避免高亮别处时点开的卡片看不清；
+ * 高亮的那张卡片如果不是详情卡，和直接上下游一样加关联光圈。
+ */
+function applyFocus(element, key, related) {
+  const selected = key === state.selectedKey;
+  element.classList.toggle("is-related", Boolean(related?.has(key)) && !selected);
+  element.classList.toggle("is-faded", Boolean(related) && !related.has(key) && !selected);
+}
+
+/** 连线是否与高亮任务直接相连。 */
+function touchesFocus(edge) {
+  return Boolean(state.focusKey) && (edge.from === state.focusKey || edge.to === state.focusKey);
 }
 
 /** 只强调来源、环、缺失及敏感隐藏；非可领取的完成/进行中不是业务阻塞。 */
@@ -508,34 +693,582 @@ function isStructuralWarning(diagnostic) {
   return code.startsWith("source_") || ["dependency_cycle", "missing_dependency", "unknown_status", "sensitive_content_withheld"].includes(code);
 }
 
+/** 切任务只改已有卡片和连线的选中态。
+ *  不重建整图，也不发起快照请求；数量或工作键对不上当前快照时退回整图渲染。 */
+function updateSelectionPresentation() {
+  const cards = [...ui.cards.children];
+  const edges = [...ui.edges.children];
+  const nodes = state.snapshot?.nodes || [];
+  const models = state.snapshot?.edges || [];
+  if (cards.length !== nodes.length || edges.length !== models.length) {
+    renderGraph();
+    return;
+  }
+  const cardByKey = new Map(cards.map((card) => [card.dataset.nodeKey, card]));
+  if (nodes.some((node) => !cardByKey.has(node.key))) {
+    renderGraph();
+    return;
+  }
+  const related = relatedKeys();
+  ui.world.classList.toggle("has-focus", Boolean(related));
+  for (const node of nodes) {
+    const card = cardByKey.get(node.key);
+    const selected = node.key === state.selectedKey;
+    card.classList.toggle("is-selected", selected);
+    card.setAttribute("aria-pressed", String(selected));
+    applyFocus(card, node.key, related);
+  }
+  const edgeById = new Map(edges.map((edge) => [edge.dataset.edgeId, edge]));
+  for (const model of models) {
+    const edge = edgeById.get(model.id);
+    if (!edge) {
+      renderGraph();
+      return;
+    }
+    edge.classList.toggle("is-highlighted", touchesFocus(model));
+    edge.classList.toggle("is-faded", Boolean(related) && !touchesFocus(model));
+  }
+  // 与高亮任务相连的线移到最后绘制，压在渐隐连线之上。
+  for (const model of models) if (touchesFocus(model)) ui.edges.append(edgeById.get(model.id));
+}
+
 /** 一次更新卡片与线，保持世界变换；键盘焦点随同一工作键恢复。 */
 function renderGraph() {
   if (!state.snapshot) return;
   const focusedKey = document.activeElement?.closest?.("[data-node-key]")?.dataset.nodeKey;
   const paths = document.createDocumentFragment();
+  const highlighted = document.createDocumentFragment();
+  const related = relatedKeys();
+  ui.world.classList.toggle("has-focus", Boolean(related));
+  const laneOf = new Map(state.graphLanes.flatMap((frame) => frame.keys.map((key) => [key, frame.key])));
   for (const edge of state.snapshot.edges) {
-    const className = ["dependency-edge", edge.satisfied ? "satisfied" : "", edge.required ? "" : "optional"].filter(Boolean).join(" ");
+    const crossLane = laneOf.size > 0 && laneOf.get(edge.from) !== laneOf.get(edge.to);
+    const className = ["dependency-edge", edge.satisfied ? "satisfied" : "", edge.required ? "" : "optional", crossLane ? "cross-lane" : ""].filter(Boolean).join(" ");
     const path = svgElement("path", { d: edgePath(edge), class: className });
     path.dataset.edgeId = edge.id;
     path.classList.toggle("is-dimmed", !matchesFilter(state.nodes.get(edge.from)) || !matchesFilter(state.nodes.get(edge.to)));
-    path.classList.toggle("is-highlighted", edge.from === state.selectedKey || edge.to === state.selectedKey);
-    paths.append(path);
+    path.classList.toggle("is-highlighted", touchesFocus(edge));
+    path.classList.toggle("is-faded", Boolean(related) && !touchesFocus(edge));
+    (touchesFocus(edge) ? highlighted : paths).append(path);
   }
   ui.edges.setAttribute("width", String(state.graphSize.width));
   ui.edges.setAttribute("height", String(state.graphSize.height));
-  ui.edges.replaceChildren(paths);
+  // 与高亮任务相连的线最后绘制，压在其他连线之上。
+  ui.edges.replaceChildren(paths, highlighted);
   const cards = document.createDocumentFragment();
   let focusTarget = null;
   for (const node of state.snapshot.nodes) {
-    const card = createCard(node);
+    const card = createCard(node, related);
     if (node.key === focusedKey) focusTarget = card;
     cards.append(card);
   }
   ui.cards.replaceChildren(cards);
+  const colors = laneColors(state.snapshot);
+  ui.graphLanes.replaceChildren(...state.graphLanes.map((frame) => laneFrame(frame, colors.get(frame.key))));
+  alignHaloRotation();
   ui.world.style.width = `${state.graphSize.width}px`;
   ui.world.style.height = `${state.graphSize.height}px`;
   applyTransform();
   if (focusTarget) focusTarget.focus({ preventScroll: true });
+}
+
+/**
+ * 依赖图卡片与时间线任务卡每次刷新都会整组重建，CSS动画会随新元素从0度重新开始；把外圈光环的起点统一钉在
+ * 文档时间线0点，角度只由页面时间决定，五秒刷新时不回跳，多张运行卡片也同相旋转。
+ * 只调整动画相位，不读取或改变运行期限；减少动态效果时没有该动画，自然跳过。
+ */
+function alignHaloRotation() {
+  if (typeof document.getAnimations !== "function") return;
+  for (const animation of document.getAnimations()) {
+    if (animation.animationName === "card-halo-rotate" && animation.startTime !== 0) animation.startTime = 0;
+  }
+}
+
+/** 浏览器所在时区的当日零点；时间线按整日划分横轴。 */
+function dayStart(timestamp) {
+  const day = new Date(timestamp);
+  day.setHours(0, 0, 0, 0);
+  return day.getTime();
+}
+
+/** 月-日短标签，用于刻度与任务提示；时区取浏览器本地设置。 */
+function dateLabel(timestamp) {
+  const day = new Date(timestamp);
+  return `${String(day.getMonth() + 1).padStart(2, "0")}-${String(day.getDate()).padStart(2, "0")}`;
+}
+
+/** 编号分组颜色表：按快照泳道顺序取色，零散任务固定灰色；依赖图“缺少的任务”框另用粉色。 */
+function laneColors(snapshot) {
+  const colors = new Map([[MISSING_LANE_KEY, MISSING_COLOR]]);
+  let index = 0;
+  for (const lane of snapshot?.lanes ?? []) colors.set(lane.key, lane.scattered ? SCATTERED_COLOR : LANE_COLORS[index++ % LANE_COLORS.length]);
+  return colors;
+}
+
+/** 进行中且最近活动早于阈值时返回停滞整日数，否则为0；已完成、待办等不算停滞。 */
+function staleDays(node, now) {
+  if (node.status !== "in_progress" || !node.activity) return 0;
+  const days = Math.floor((now - node.activity.lastAt) / DAY_MS);
+  return days >= TIMELINE.staleDays ? days : 0;
+}
+
+/**
+ * 计算泳道时间线坐标，不写DOM，便于先完整算完再一次替换画面。
+ * 横轴从最早活动当日到今天；每张任务卡从首次活动日开始，宽度不小于固定卡宽，跨度更长时随跨度加宽，
+ * 卡片顶部色条为首次到最近活动；停滞任务从卡片右缘到今天另画虚线尾巴。
+ * 没有活动记录的任务放在最左侧的“无活动记录”栏，不伪造日期。
+ * 同一泳道内按开始时间贪心分行：任务卡和停滞尾巴都不与同行其他任务重叠。
+ */
+function calculateTimeline(snapshot, viewportWidth, now) {
+  const nodes = new Map(snapshot.nodes.map((node) => [node.key, node]));
+  const lanes = snapshot.lanes ?? [];
+  const members = lanes.flatMap((lane) => lane.workKeys.map((key) => nodes.get(key)));
+  const dated = members.filter((node) => node.activity);
+  const undatedWidth = members.length > dated.length ? TIMELINE.undatedWidth : 0;
+  const start = dated.length ? dayStart(Math.min(...dated.map((node) => node.activity.firstAt))) : dayStart(now);
+  const days = Math.max(1, Math.round((dayStart(now) - start) / DAY_MS) + 1);
+  // 右侧至少留出一张卡宽，今天开始的任务也能完整显示；日宽在上下限内尽量铺满可见宽度。
+  const trailing = TIMELINE.cardWidth + 16;
+  const available = viewportWidth - TIMELINE.labelWidth - undatedWidth - trailing;
+  const dayWidth = Math.max(TIMELINE.minDayWidth, Math.min(TIMELINE.maxDayWidth, available / days));
+  const x = (timestamp) => undatedWidth + (timestamp - start) / DAY_MS * dayWidth;
+  const nowX = x(now);
+  const positions = new Map();
+  const laneLayouts = [];
+  let top = TIMELINE.axisHeight;
+  let furthest = 0;
+  for (const lane of lanes) {
+    const items = lane.workKeys.map((key) => nodes.get(key)).sort((left, right) =>
+      (left.activity ? 1 : 0) - (right.activity ? 1 : 0) || (left.activity?.firstAt ?? 0) - (right.activity?.firstAt ?? 0)
+      || compareNodes(left, right));
+    const rowEnds = [];
+    const placed = [];
+    for (const node of items) {
+      let left; let bar = 0; let width = TIMELINE.cardWidth; let stale = 0; let extent;
+      if (node.activity) {
+        left = x(node.activity.firstAt);
+        bar = Math.max(x(node.activity.lastAt) - left, TIMELINE.minBarWidth);
+        width = Math.max(TIMELINE.cardWidth, bar);
+        stale = staleDays(node, now);
+        // 停滞尾巴画到今天，并在今天线右侧留出“停滞”字样的位置。
+        extent = Math.max(left + width, stale ? nowX + 12 : 0);
+      } else {
+        // 无活动记录只有卡片，没有时间色条，固定放在左侧专栏内。
+        left = 12; extent = left + width;
+      }
+      let row = rowEnds.findIndex((end) => end + 10 <= left);
+      if (row === -1) { row = rowEnds.length; rowEnds.push(extent); } else rowEnds[row] = extent;
+      furthest = Math.max(furthest, extent);
+      placed.push({ node, left, width, bar, stale, row });
+    }
+    const pitch = TIMELINE.cardHeight + TIMELINE.rowGap;
+    const height = Math.max(92, TIMELINE.lanePadding * 2 + Math.max(1, rowEnds.length) * pitch - TIMELINE.rowGap);
+    for (const item of placed) {
+      item.top = top + TIMELINE.lanePadding + item.row * pitch;
+      item.y = item.top + TIMELINE.cardHeight / 2;
+      item.right = item.left + item.width;
+      positions.set(item.node.key, item);
+    }
+    laneLayouts.push({ lane, top, height, items: placed });
+    top += height;
+  }
+  // 轨道宽度覆盖最右的标签，否则溢出的标签会把滚动区域撑到泳道之外；
+  // 数据较短时泳道仍铺满可见宽度，避免右侧露出没有底色和分隔线的空白。
+  const trackWidth = Math.max(undatedWidth + days * dayWidth + trailing, furthest + 12, viewportWidth - TIMELINE.labelWidth);
+  return { start, days, dayWidth, undatedWidth, nowX, trackWidth, width: TIMELINE.labelWidth + trackWidth, height: top,
+    lanes: laneLayouts, positions, viewportWidth };
+}
+
+/** 生成泳道左侧固定标题：分组色条、名称、分组来源标记、完成数与停滞数、组内完成进度。 */
+function laneHead(laneLayout, color) {
+  const { lane, items } = laneLayout;
+  const head = element("div", "lane-head");
+  head.style.setProperty("--lane-color", color);
+  const override = items.some((item) => item.node.group?.origin === "override");
+  const origin = lane.scattered ? "零散" : lane.labelled || override ? "看板覆盖" : "编号分组";
+  head.title = lane.scattered ? "只有一项或没有可辨认编号的工作；可在看板登记清单中改名、合并或指派。"
+    : lane.labelled || override ? `名称或成员来自本看板登记清单的覆盖；分组键 ${lane.key}。不代表被查看项目声明的业务线。`
+      : `按编号前缀 ${lane.key} 自动分组，不代表业务归属。`;
+  const title = element("div", "lane-title");
+  title.append(element("span", "lane-label", lane.label), element("span", `lane-origin${lane.scattered ? " scattered" : ""}`, origin));
+  const { counts } = lane;
+  const stale = items.filter((item) => item.stale).length;
+  const parts = [`完成 ${counts.progress.done}/${counts.progress.total}`];
+  if (counts.inProgress) parts.push(`进行中 ${counts.inProgress}`);
+  if (counts.blocked) parts.push(`阻塞 ${counts.blocked}`);
+  const summary = element("div", "lane-summary", parts.join(" · "));
+  if (stale) summary.append(element("span", "lane-stale", ` · 停滞 ${stale}`));
+  const progress = element("div", "lane-progress");
+  const fill = element("span");
+  fill.style.width = `${Math.round((counts.progress.ratio ?? 0) * 100)}%`;
+  progress.append(fill);
+  head.append(title, summary, progress);
+  return head;
+}
+
+/** 任务卡页脚的日期范围：同日只写一次，无活动写明“无活动记录”。 */
+function activityRange(node) {
+  if (!node.activity) return "无活动记录";
+  const first = dateLabel(node.activity.firstAt);
+  const last = dateLabel(node.activity.lastAt);
+  return first === last ? first : `${first} → ${last}`;
+}
+
+/**
+ * 生成单张任务卡按钮：顶部色条为真实活动跨度，正文两行标题，页脚为状态、日期与停滞/认领/可领取标记。
+ * 来源文字只经 textContent 写入，完整编号保留在数据属性与提示里。
+ */
+function timelineItem(item, now, related = null) {
+  const { node } = item;
+  const button = element("button", `timeline-item status-${node.status}`);
+  button.type = "button";
+  button.dataset.timelineKey = node.key;
+  button.dataset.testid = "timeline-item";
+  const range = activityRange(node);
+  const staleText = item.stale ? ` · 已 ${item.stale} 天无活动` : "";
+  button.title = `${node.key} ${node.title}\n${STATUS_LABELS[node.status]} · ${range}${staleText}`;
+  button.setAttribute("aria-label", `${node.key} ${node.title} ${STATUS_LABELS[node.status]} ${range}${staleText}`);
+  button.setAttribute("aria-pressed", String(node.key === state.selectedKey));
+  button.classList.toggle("is-selected", node.key === state.selectedKey);
+  button.classList.toggle("is-dimmed", !matchesFilter(node));
+  button.classList.toggle("is-ready", node.ready);
+  button.classList.toggle("is-undated", !node.activity);
+  applyFocus(button, node.key, related);
+  button.style.left = `${item.left}px`;
+  button.style.top = `${item.top}px`;
+  button.style.width = `${item.width}px`;
+  if (node.activity) {
+    const bar = element("span", "timeline-bar");
+    bar.style.width = `${item.bar}px`;
+    button.append(bar);
+  }
+  button.append(element("span", "timeline-title", taskTitle(node)));
+  const footer = element("span", "timeline-meta");
+  footer.append(element("span", "timeline-status", node.missing ? "缺少任务" : STATUS_LABELS[node.status]), element("span", "timeline-range", range));
+  if (item.stale) footer.append(element("span", "timeline-stale-badge", `停滞 ${item.stale} 天`));
+  if (node.claims.length) {
+    const icon = element("span", "claim-icon", "♟");
+    icon.title = "存在有效认领；分支和负责人见详情，不表示你拥有认领";
+    footer.append(icon);
+  }
+  if (node.ready) footer.append(element("span", "ready-label", "☛ 可领取"));
+  button.append(footer);
+  if (Number.isSafeInteger(node.agentRunningUntil) && node.agentRunningUntil > now) {
+    const running = element("span", "timeline-running");
+    running.dataset.validUntil = String(node.agentRunningUntil);
+    running.title = "有智能体正在执行";
+    button.append(running);
+  }
+  return button;
+}
+
+/** 停滞尾巴：从任务卡右缘画虚线到今天；卡片本身已写明停滞天数。不响应点击，不遮挡任务卡。 */
+function staleTail(item, nowX, related = null) {
+  const tail = element("span", "timeline-stale-tail");
+  tail.setAttribute("aria-hidden", "true");
+  tail.dataset.tailKey = item.node.key;
+  applyFocus(tail, item.node.key, related);
+  tail.style.left = `${item.right}px`;
+  tail.style.top = `${item.y - 1}px`;
+  tail.style.width = `${Math.max(0, nowX - item.right)}px`;
+  return tail;
+}
+
+/** 绘制时间刻度：每日竖线，按日宽稀疏标注日期，每周一加粗；左侧可有“无活动记录”专栏。 */
+function timelineAxis(layout) {
+  const axis = element("div", "timeline-axis");
+  axis.style.width = `${layout.width}px`;
+  const corner = element("div", "timeline-corner", "编号分组");
+  corner.title = "泳道按工作编号前缀自动分组，不代表业务线；可在看板登记清单中改名或合并。";
+  const ticks = element("div", "timeline-ticks");
+  ticks.style.width = `${layout.trackWidth}px`;
+  if (layout.undatedWidth) {
+    const undated = element("span", "timeline-tick undated", "无活动记录");
+    undated.style.width = `${layout.undatedWidth}px`;
+    ticks.append(undated);
+  }
+  const step = Math.max(1, Math.ceil(56 / layout.dayWidth));
+  for (let index = 0; index < layout.days; index += 1) {
+    const day = new Date(layout.start);
+    day.setDate(day.getDate() + index);
+    const tick = element("span", `timeline-tick${day.getDay() === 1 ? " week" : ""}`, index % step === 0 ? dateLabel(day.getTime()) : "");
+    tick.style.left = `${layout.undatedWidth + index * layout.dayWidth}px`;
+    tick.style.width = `${layout.dayWidth}px`;
+    ticks.append(tick);
+  }
+  // “今天”标签放在粘性刻度行内，纵向滚动时始终可见；竖线本身在泳道层绘制。
+  const today = element("span", "timeline-today-label", "今天");
+  today.style.left = `${layout.nowX}px`;
+  ticks.append(today);
+  axis.append(corner, ticks);
+  return axis;
+}
+
+/** 高亮任务时画出它与直接上下游的连线；可选依赖用虚线。线只连接本快照内有坐标的任务。 */
+function timelineRelations(layout) {
+  const svg = svgElement("svg", { class: "timeline-relations", width: layout.trackWidth, height: layout.height, "aria-hidden": "true" });
+  svg.style.left = `${TIMELINE.labelWidth}px`;
+  const focused = state.focusKey;
+  if (!focused || !layout.positions.has(focused)) return svg;
+  for (const edge of state.snapshot.edges) {
+    if (edge.from !== focused && edge.to !== focused) continue;
+    const from = layout.positions.get(edge.from);
+    const to = layout.positions.get(edge.to);
+    if (!from || !to || from === to) continue;
+    const startX = from.right;
+    const endX = to.left;
+    const bend = Math.max(24, Math.abs(endX - startX) / 3);
+    const path = svgElement("path", { d: `M ${startX} ${from.y} C ${startX + bend} ${from.y}, ${endX - bend} ${to.y}, ${endX} ${to.y}`,
+      class: ["timeline-relation", edge.satisfied ? "satisfied" : "", edge.required ? "" : "optional"].filter(Boolean).join(" ") });
+    path.dataset.edgeId = edge.id;
+    svg.append(path);
+  }
+  return svg;
+}
+
+/**
+ * 整体重建泳道时间线，但保留滚动位置与键盘焦点；同一数据的坐标不变，五秒刷新不会跳动。
+ * 首次显示某项目时滚到最右侧，让“今天”和最近的工作出现在视野内。
+ * 依赖图视图下不计算（隐藏容器没有宽度），切换回来时再绘制。
+ */
+function renderTimeline() {
+  if (!state.snapshot || state.view !== "timeline") return;
+  const scroll = ui.timelineScroll;
+  const focusedKey = document.activeElement?.closest?.("[data-timeline-key]")?.dataset.timelineKey;
+  const now = Date.now();
+  if (!Array.isArray(state.snapshot.lanes)) {
+    ui.timelineCanvas.replaceChildren(element("p", "timeline-unavailable", "当前快照没有编号分组数据，请切换到依赖图查看。"));
+    state.timelineLayout = null;
+    return;
+  }
+  const layout = calculateTimeline(state.snapshot, scroll.clientWidth, now);
+  const fragment = document.createDocumentFragment();
+  fragment.append(timelineAxis(layout));
+  let focusTarget = null;
+  const colors = laneColors(state.snapshot);
+  const related = relatedKeys();
+  ui.timelineCanvas.classList.toggle("has-focus", Boolean(related));
+  for (const laneLayout of layout.lanes) {
+    const row = element("div", `timeline-lane${laneLayout.lane.scattered ? " scattered" : ""}`);
+    row.dataset.laneKey = laneLayout.lane.key;
+    row.dataset.testid = "timeline-lane";
+    row.style.height = `${laneLayout.height}px`;
+    row.style.width = `${layout.width}px`;
+    const track = element("div", "lane-track");
+    track.style.width = `${layout.trackWidth}px`;
+    for (const item of laneLayout.items) {
+      const local = { ...item, top: item.top - laneLayout.top, y: item.y - laneLayout.top };
+      if (item.stale) track.append(staleTail(local, layout.nowX, related));
+      const button = timelineItem(local, now, related);
+      if (item.node.key === focusedKey) focusTarget = button;
+      track.append(button);
+    }
+    row.append(laneHead(laneLayout, colors.get(laneLayout.lane.key)), track);
+    fragment.append(row);
+  }
+  const today = element("div", "timeline-today");
+  today.style.left = `${TIMELINE.labelWidth + layout.nowX}px`;
+  today.style.height = `${layout.height}px`;
+  fragment.append(today, timelineRelations(layout));
+  const { scrollLeft, scrollTop } = scroll;
+  ui.timelineCanvas.style.width = `${layout.width}px`;
+  ui.timelineCanvas.style.height = `${layout.height}px`;
+  ui.timelineCanvas.replaceChildren(fragment);
+  state.timelineLayout = layout;
+  if (!state.timelineScrolled && scroll.clientWidth) {
+    scroll.scrollLeft = scroll.scrollWidth;
+    state.timelineScrolled = true;
+  } else {
+    scroll.scrollLeft = scrollLeft;
+    scroll.scrollTop = scrollTop;
+  }
+  if (focusTarget) focusTarget.focus({ preventScroll: true });
+  alignHaloRotation();
+}
+
+/** 切换选中只改任务条状态并重画关系线，不重建泳道，也不发起快照请求。 */
+function updateTimelineSelection() {
+  const layout = state.timelineLayout;
+  if (!layout || state.view !== "timeline") return;
+  const related = relatedKeys();
+  ui.timelineCanvas.classList.toggle("has-focus", Boolean(related));
+  for (const button of ui.timelineCanvas.querySelectorAll("[data-timeline-key]")) {
+    const selected = button.dataset.timelineKey === state.selectedKey;
+    button.classList.toggle("is-selected", selected);
+    button.setAttribute("aria-pressed", String(selected));
+    applyFocus(button, button.dataset.timelineKey, related);
+  }
+  for (const tail of ui.timelineCanvas.querySelectorAll("[data-tail-key]")) applyFocus(tail, tail.dataset.tailKey, related);
+  ui.timelineCanvas.querySelector(".timeline-relations")?.replaceWith(timelineRelations(layout));
+}
+
+/** 把指定任务条滚入可见区域；只移动时间线滚动，不改变选择以外的任何状态。 */
+function revealTimelineItem(key) {
+  const button = [...ui.timelineCanvas.querySelectorAll("[data-timeline-key]")].find((item) => item.dataset.timelineKey === key);
+  button?.scrollIntoView({ block: "nearest", inline: "center" });
+}
+
+/** 从地址片段读取视图；只接受三个固定值。没有片段时沿用本浏览器上次手动选择的视图，否则默认时间线。 */
+function viewFromHash() {
+  const match = window.location.hash.match(/^#view=(timeline|graph|classic)$/);
+  if (match) return match[1];
+  try {
+    const saved = window.localStorage.getItem(VIEW_KEY);
+    if (VIEWS.includes(saved)) return saved;
+  } catch {
+    // 存储不可用时使用默认视图。
+  }
+  return "timeline";
+}
+
+/**
+ * 切换视图：更新按钮与片段地址，适应宽度和1:1只作用于依赖图与旧版看板；不重新读取快照。
+ * 依赖图与旧版看板共用画布但坐标不同，二者互切时换用对应坐标并重新适应宽度。
+ */
+function setView(view, updateHash = true, remember = false) {
+  if (!VIEWS.includes(view)) return;
+  const previous = state.view;
+  state.view = view;
+  ui.canvasArea.dataset.view = view;
+  document.body.dataset.view = view;
+  for (const button of ui.viewSwitch.querySelectorAll("[data-view]")) button.setAttribute("aria-pressed", String(button.dataset.view === view));
+  ui.fit.disabled = view === "timeline";
+  ui.actual.disabled = view === "timeline";
+  // 片段地址不发往服务；保留历史条目里的项目选择，只替换当前条目的地址。
+  if (updateHash && window.location.hash !== `#view=${view}`) window.history.replaceState(window.history.state, "", `#view=${view}`);
+  if (remember) {
+    try { window.localStorage.setItem(VIEW_KEY, view); } catch { /* 存储不可用时只影响下次默认视图。 */ }
+  }
+  renderOverview();
+  if (view === "timeline") { renderTimeline(); return; }
+  const layoutChanged = (previous === "classic") !== (view === "classic");
+  if (layoutChanged && state.graphLayouts) {
+    applyGraphLayout();
+    renderGraph();
+    if (state.snapshot?.nodes.length) fitGraph();
+  } else if (state.viewMode === "fit" && state.snapshot?.nodes.length) fitGraph();
+}
+
+/** 总览中的任务条目：点击即选中并在时间线中定位，与任务条共用同一选择。 */
+function overviewTask(node, lead, detail, leadClass = "") {
+  const button = element("button", `overview-item status-${node.status}`);
+  button.type = "button";
+  button.dataset.overviewKey = node.key;
+  button.title = `${node.key} ${node.title}`;
+  button.setAttribute("aria-current", String(node.key === state.selectedKey));
+  button.append(element("span", `overview-lead${leadClass ? ` ${leadClass}` : ""}`, lead), element("span", "overview-title", taskTitle(node)),
+    element("span", "overview-detail", detail));
+  return button;
+}
+
+/** 列表重建时保留各自滚动位置，五秒刷新不会把已经往下翻的列表弹回顶部。 */
+function replaceList(list, items, emptyText) {
+  const { scrollTop } = list;
+  list.replaceChildren(...(items.length ? items : [element("p", "overview-empty", emptyText)]));
+  list.scrollTop = scrollTop;
+}
+
+/**
+ * 渲染时间线上方的总览：各编号分组完成率、停滞任务（进行中且超过7天无活动，按停滞天数降序）、
+ * 近7天有活动的任务（按最近活动降序）。只读取当前快照，口径与泳道标题一致；依赖图视图下隐藏。
+ */
+function renderOverview() {
+  const snapshot = state.snapshot;
+  const visible = Boolean(snapshot && Array.isArray(snapshot.lanes) && snapshot.nodes.length && state.view === "timeline");
+  ui.overview.hidden = !visible;
+  state.overviewVisible = visible;
+  ui.canvasArea.classList.toggle("has-overview", visible);
+  ui.canvasArea.classList.toggle("overview-collapsed", state.overviewCollapsed);
+  ui.overviewToggle.textContent = state.overviewCollapsed ? "展开" : "收起";
+  ui.overviewToggle.setAttribute("aria-expanded", String(!state.overviewCollapsed));
+  if (!visible) return;
+  const now = Date.now();
+  const laneOf = new Map(snapshot.lanes.flatMap((lane) => lane.workKeys.map((key) => [key, lane])));
+  const members = [...laneOf.keys()].map((key) => state.nodes.get(key));
+  const stale = members.map((node) => ({ node, days: staleDays(node, now) })).filter((item) => item.days)
+    .sort((left, right) => right.days - left.days || compareNodes(left.node, right.node));
+  const recent = members.filter((node) => node.activity && now - node.activity.lastAt <= RECENT_DAYS * DAY_MS)
+    .sort((left, right) => right.activity.lastAt - left.activity.lastAt || compareNodes(left, right));
+  const inProgress = members.filter((node) => node.status === "in_progress").length;
+  ui.overviewSummary.textContent = `${snapshot.lanes.length} 个编号分组 · 进行中 ${inProgress} · 停滞 ${stale.length} · 近${RECENT_DAYS}天有活动 ${recent.length}`;
+  ui.overviewStaleTitle.textContent = `停滞任务（进行中且超过${TIMELINE.staleDays}天无活动）${stale.length}`;
+  ui.overviewRecentTitle.textContent = `近${RECENT_DAYS}天有活动 ${recent.length}`;
+  const colors = laneColors(snapshot);
+  const lanes = snapshot.lanes.map((lane) => {
+    const button = element("button", `overview-lane${lane.scattered ? " scattered" : ""}`);
+    button.type = "button";
+    button.dataset.overviewLane = lane.key;
+    button.style.setProperty("--lane-color", colors.get(lane.key));
+    const { progress } = lane.counts;
+    const laneStale = stale.filter((item) => laneOf.get(item.node.key) === lane).length;
+    button.title = `${lane.label}：完成 ${progress.done}/${progress.total}${laneStale ? `，停滞 ${laneStale}` : ""}。点击定位到该泳道。`;
+    const bar = element("span", "overview-lane-bar");
+    const fill = element("span");
+    fill.style.width = `${Math.round((progress.ratio ?? 0) * 100)}%`;
+    bar.append(fill);
+    button.append(element("span", "overview-lane-label", lane.label), bar, element("span", "overview-lane-count", `${progress.done}/${progress.total}`),
+      element("span", "overview-lane-stale", laneStale ? `停滞 ${laneStale}` : ""));
+    return button;
+  });
+  replaceList(ui.overviewLanes, lanes, "没有编号分组");
+  replaceList(ui.overviewStale, stale.map(({ node, days }) => overviewTask(node, `${days} 天`, laneOf.get(node.key).label, "stale")),
+    `没有超过${TIMELINE.staleDays}天无活动的进行中任务`);
+  replaceList(ui.overviewRecent, recent.map((node) => overviewTask(node, dateLabel(node.activity.lastAt),
+    `${STATUS_LABELS[node.status]} · ${laneOf.get(node.key).label}`)), `近${RECENT_DAYS}天没有活动记录`);
+}
+
+/** 只更新总览条目的当前选中标记，不重建列表。 */
+function updateOverviewSelection() {
+  // 依赖图视图或没有编号分组时总览未显示，不必查询条目。
+  if (!state.overviewVisible) return;
+  for (const button of ui.overview.querySelectorAll("[data-overview-key]")) {
+    button.setAttribute("aria-current", String(button.dataset.overviewKey === state.selectedKey));
+  }
+}
+
+/** 把指定泳道滚到时间线可见区域顶部（刻度行下方），并短暂高亮提示位置。 */
+function revealLane(key) {
+  const row = [...ui.timelineCanvas.querySelectorAll("[data-lane-key]")].find((item) => item.dataset.laneKey === key);
+  if (!row) return;
+  ui.timelineScroll.scrollTop = row.offsetTop - TIMELINE.axisHeight;
+  row.classList.remove("is-flashing");
+  void row.offsetWidth;
+  row.classList.add("is-flashing");
+}
+
+/** 总览点击：任务条目选中并定位，分组条目定位到泳道。 */
+function onOverviewClick(event) {
+  const task = event.target.closest("[data-overview-key]");
+  if (task) { selectNode(task.dataset.overviewKey, true); return; }
+  const lane = event.target.closest("[data-overview-lane]");
+  if (lane) revealLane(lane.dataset.overviewLane);
+}
+
+/** 收起或展开总览；偏好只存一个布尔值，存储不可用时本页仍按当前选择显示。 */
+function toggleOverview() {
+  state.overviewCollapsed = !state.overviewCollapsed;
+  try { window.localStorage.setItem(OVERVIEW_KEY, String(state.overviewCollapsed)); } catch { /* 偏好写入失败不影响显示。 */ }
+  renderOverview();
+}
+
+/** 视图按钮事件委托。 */
+function onViewClick(event) {
+  const button = event.target.closest("[data-view]");
+  if (button) setView(button.dataset.view, true, true);
+}
+
+/** 时间线任务条单击只显示详情，与依赖图卡片共用同一选中状态和详情栏；高亮关联任务改由双击。 */
+function onTimelineClick(event) {
+  const item = event.target.closest("[data-timeline-key]");
+  if (item) selectNode(item.dataset.timelineKey);
+  // 点在泳道空白处同时取消详情与高亮；泳道标题等按钮不算空白。
+  else if (event.target.closest(".lane-track")) clearSelection();
+}
+
+/** 时间线任务条双击切换关联高亮。 */
+function onTimelineDoubleClick(event) {
+  const item = event.target.closest("[data-timeline-key]");
+  if (item) toggleFocus(item.dataset.timelineKey);
 }
 
 /** 创建详情分区，正文以独立元素写入，避免任何源字符串变成标记。 */
@@ -552,7 +1285,9 @@ function adjacencySection(title, keys) {
   for (const key of keys) {
     const node = state.nodes.get(key);
     if (!node) continue;
-    const button = element("button", `dependency-chip ${node.status}`, `${node.key} ${node.title}`);
+    const button = element("button", `dependency-chip ${node.status}`);
+    // 名称与编号分行显示；选择属性始终使用完整工作键，允许多个任务同名。
+    button.append(element("span", "dependency-title", taskTitle(node)), element("span", "dep-id", node.key));
     button.type = "button";
     button.dataset.selectKey = node.key;
     button.dataset.testid = "adjacent-node";
@@ -575,7 +1310,11 @@ function renderDetails() {
     ui.details.replaceChildren(content);
     return;
   }
-  content.append(element("h2", "detail-title", `${node.key} ${node.title}`));
+  content.append(element("h2", "detail-title", taskTitle(node)));
+  // 编号独立保留为可全选的纯文本，不让显示名称参与身份关联。
+  const identity = element("p", "detail-id", "工作项编号：");
+  identity.append(element("code", "", node.key));
+  content.append(identity);
   const badges = element("div", "detail-badges");
   badges.append(element("span", `detail-badge ${node.status}`, STATUS_LABELS[node.status]));
   if (node.priority) badges.append(element("span", "detail-badge priority", node.priority));
@@ -784,6 +1523,13 @@ async function refreshSnapshot({ allowPaused = false } = {}) {
 
 /** 250毫秒检查节拍并更新倒计时，单飞保护避免慢服务下请求堆积。 */
 function onClockTick() {
+  // 暂停、请求失败或页面后台停留都不能让旧运行信号无限存续。
+  for (const icon of ui.cards.querySelectorAll(".agent-running-icon")) {
+    if (Number(icon.dataset.validUntil) <= Date.now()) icon.remove();
+  }
+  for (const icon of ui.timelineCanvas.querySelectorAll(".timeline-running")) {
+    if (Number(icon.dataset.validUntil) <= Date.now()) icon.remove();
+  }
   if (state.pageInactive) return;
   if (!state.projectsInFlight && Date.now() >= state.nextProjectsRefreshAt) void refreshProjects();
   // 自动图读取先等本节拍的名单核验；手动选择仍可立即读取已合法登记的目标。
@@ -802,15 +1548,20 @@ function togglePause() {
   renderEmpty();
 }
 
-/** 写入唯一画布世界变换，使线与按钮卡片始终同步平移和缩放。 */
+/** 写入唯一画布世界变换，使线与按钮卡片始终同步平移和缩放。
+ *  同时发布无单位的 --graph-scale，供外圈光环和加粗边框在缩放小于 1 时按设计像素除以缩放反向补偿。
+ *  补偿后的屏幕厚度等于 1:1 设计值；缩放不小于 1 时样式里的 max 保持原像素，不会额外加粗。
+ *  变量与 transform 只在这里一起写，避免缩放和补偿各走各的。卡片外框仍由布局宽高决定。 */
 function applyTransform() {
   ui.world.style.transform = `translate(${state.x}px, ${state.y}px) scale(${state.scale})`;
   ui.world.dataset.scale = String(state.scale);
+  ui.world.style.setProperty("--graph-scale", String(state.scale));
 }
 
 /** 根据画布可用宽度适配并居中；小图保持卡片原尺寸，不无限放大。 */
 function fitGraph() {
-  if (!state.graphSize.width) return;
+  // 依赖图被时间线视图隐藏时没有宽度；此时只保留适配模式，显示后由尺寸观察再适配。
+  if (!state.graphSize.width || !ui.viewport.clientWidth) return;
   state.scale = Math.max(.001, Math.min(1, (ui.viewport.clientWidth - 64) / state.graphSize.width));
   state.x = (ui.viewport.clientWidth - state.graphSize.width * state.scale) / 2;
   state.y = (ui.viewport.clientHeight - state.graphSize.height * state.scale) / 2;
@@ -832,9 +1583,12 @@ function selectNode(key, center = false) {
   if (!state.nodes.has(key)) return;
   state.selectedKey = key;
   state.selectionRemoved = false;
-  renderGraph();
+  updateSelectionPresentation();
+  updateTimelineSelection();
+  updateOverviewSelection();
   renderDetails();
-  if (center) {
+  if (center && state.view === "timeline") revealTimelineItem(key);
+  else if (center) {
     const position = state.positions.get(key);
     state.x = ui.viewport.clientWidth / 2 - position.x * state.scale;
     state.y = ui.viewport.clientHeight / 2 - position.y * state.scale;
@@ -843,10 +1597,61 @@ function selectNode(key, center = false) {
   }
 }
 
-/** 通过事件委托选择任务，原生按钮同时支持 Tab、Enter 和空格。 */
+/** 同时取消详情选中与关联高亮：所有卡片与连线恢复正常显示，详情栏回到提示；不发起快照请求。 */
+function clearSelection() {
+  if (!state.selectedKey && !state.focusKey) return;
+  state.selectedKey = null;
+  state.focusKey = null;
+  state.selectionRemoved = false;
+  updateSelectionPresentation();
+  updateTimelineSelection();
+  updateOverviewSelection();
+  renderDetails();
+}
+
+/** Esc 取消选中；输入框与下拉框内按键不处理。 */
+function onDocumentKeydown(event) {
+  if (event.key !== "Escape" || event.target.closest?.("input, textarea, select")) return;
+  clearSelection();
+}
+
+/**
+ * 卡片与任务条的双击切换关联高亮：双击未高亮的任务即高亮它与直接上下游并显示其详情，再双击同一任务取消高亮、保留详情。
+ * 双击前浏览器已派发两次单击，详情已切到该任务；这里仍调用 selectNode，保证只收到双击时（如辅助工具）详情同样一致。
+ * 单击、总览条目和详情邻接按钮只做选中定位，不改变高亮。
+ */
+function toggleFocus(key) {
+  if (!state.nodes.has(key)) return;
+  if (key === state.focusKey) {
+    state.focusKey = null;
+    updateSelectionPresentation();
+    updateTimelineSelection();
+    return;
+  }
+  state.focusKey = key;
+  selectNode(key);
+}
+
+/** 通过事件委托单击显示任务详情，原生按钮同时支持 Tab、Enter 和空格。 */
 function onCardClick(event) {
   const card = event.target.closest("[data-node-key]");
   if (card) selectNode(card.dataset.nodeKey);
+}
+
+/** 依赖图与旧版看板卡片双击切换关联高亮。 */
+function onCardDoubleClick(event) {
+  const card = event.target.closest("[data-node-key]");
+  if (card) toggleFocus(card.dataset.nodeKey);
+}
+
+/**
+ * 依赖图与旧版看板点画布空白（含编号分组框）同时取消详情与高亮。
+ * 拖动平移结束时浏览器也会补发一次点击，拖动过的这一次不算空白点击，避免平移后聚焦丢失。
+ */
+function onViewportClick(event) {
+  if (state.dragMoved) { state.dragMoved = false; return; }
+  if (event.target.closest("button")) return;
+  clearSelection();
 }
 
 /** 详情邻接按钮只选择并定位当前数据里的节点。 */
@@ -862,6 +1667,7 @@ function onFilterClick(event) {
   state.filter = button.dataset.filter === state.filter ? "all" : button.dataset.filter;
   updateFilterButtons();
   renderGraph();
+  renderTimeline();
   renderDetails();
 }
 
@@ -884,6 +1690,7 @@ function onCanvasWheel(event) {
 /** 从空白画布开始平移，任务按钮仍保留正常选择和键盘交互。 */
 function onPointerDown(event) {
   if (event.button !== 0 || event.target.closest("button")) return;
+  state.dragMoved = false;
   state.drag = { id: event.pointerId, startX: event.clientX, startY: event.clientY, originX: state.x, originY: state.y };
   ui.viewport.setPointerCapture(event.pointerId);
   ui.viewport.classList.add("is-dragging");
@@ -892,6 +1699,8 @@ function onPointerDown(event) {
 /** 按指针屏幕位移平移世界；状态刷新不会重置这一视口。 */
 function onPointerMove(event) {
   if (!state.drag || state.drag.id !== event.pointerId) return;
+  // 位移超过3像素才算拖动；手抖的细微移动仍按点击处理，可点空白取消选中。
+  if (Math.hypot(event.clientX - state.drag.startX, event.clientY - state.drag.startY) > 3) state.dragMoved = true;
   state.x = state.drag.originX + event.clientX - state.drag.startX;
   state.y = state.drag.originY + event.clientY - state.drag.startY;
   state.viewMode = "manual";
@@ -909,10 +1718,95 @@ function onPointerEnd(event) {
 /** 仅在用户保持宽度适配模式时响应窗口尺寸变化，手工视口不跳动。 */
 function onViewportResize() {
   if (state.viewMode === "fit" && state.fitted) fitGraph();
+  // 日宽随时间线可见宽度变化；宽度未变时坐标相同，不必重建。
+  if (state.view === "timeline" && state.timelineLayout && state.timelineLayout.viewportWidth !== ui.timelineScroll.clientWidth) renderTimeline();
+}
+
+/** 侧栏至少留下480像素画布，较窄窗口留半窗；最小侧栏也随窄窗收紧。 */
+function detailWidthBounds() {
+  const width = ui.workspace.clientWidth;
+  const max = Math.min(DETAIL_MAX_WIDTH, width - Math.min(480, width / 2));
+  return { min: Math.min(DETAIL_MIN_WIDTH, width * .4, max), max };
+}
+
+/** 按当前窗口钳制实际宽度，保留原偏好供窗口变宽时恢复，默认仍用既有样式。 */
+function applyDetailWidth() {
+  const bounds = detailWidthBounds();
+  if (state.detailWidth !== null) {
+    const width = Math.max(bounds.min, Math.min(bounds.max, state.detailWidth));
+    ui.workspace.style.setProperty("--detail-width", `${width}px`);
+  }
+  ui.detailResizer.setAttribute("aria-valuemin", String(Math.round(bounds.min)));
+  ui.detailResizer.setAttribute("aria-valuemax", String(Math.round(bounds.max)));
+  ui.detailResizer.setAttribute("aria-valuenow", String(Math.round(ui.detailPanel.getBoundingClientRect().width)));
+}
+
+/** 本地存储只保存有界宽度数值，权限或容量错误不能破坏看板只读交互。 */
+function saveDetailWidth() {
+  if (state.detailWidth === null) return;
+  try { window.localStorage.setItem(DETAIL_WIDTH_KEY, String(state.detailWidth)); } catch { /* 偏好写入失败时当前页面仍保持宽度。 */ }
+}
+
+/** 从独立拖柄开始主指针调宽，不冒泡为图平移，也不选择页面文字。 */
+function onDetailPointerDown(event) {
+  if (event.button !== 0 || !event.isPrimary || state.detailDrag) return;
+  event.preventDefault();
+  state.detailDrag = { id: event.pointerId, startX: event.clientX, startWidth: ui.detailPanel.getBoundingClientRect().width };
+  ui.detailResizer.setPointerCapture(event.pointerId);
+  document.body.classList.add("is-resizing-detail");
+}
+
+/** 捕获屏幕横向位移连续改变右栏宽度；窗体边界在每次移动时重新核对。 */
+function onDetailPointerMove(event) {
+  if (!state.detailDrag || event.pointerId !== state.detailDrag.id) return;
+  const bounds = detailWidthBounds();
+  state.detailWidth = Math.round(Math.max(bounds.min, Math.min(bounds.max,
+    state.detailDrag.startWidth + state.detailDrag.startX - event.clientX)));
+  applyDetailWidth();
+}
+
+/** 结束、取消、捕获丢失或离页均释放拖动状态；先清状态避免释放捕获时重入。 */
+function onDetailPointerEnd(event) {
+  if (!state.detailDrag || (event.pointerId !== undefined && event.pointerId !== state.detailDrag.id)) return;
+  const id = state.detailDrag.id;
+  state.detailDrag = null;
+  document.body.classList.remove("is-resizing-detail");
+  if (ui.detailResizer.hasPointerCapture(id)) ui.detailResizer.releasePointerCapture(id);
+  saveDetailWidth();
+}
+
+/** 分隔条采用标准方向键与端点操作，键盘和鼠标共用同一宽度边界及偏好。 */
+function onDetailResizeKey(event) {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  event.preventDefault();
+  const bounds = detailWidthBounds();
+  const current = ui.detailPanel.getBoundingClientRect().width;
+  const requested = event.key === "Home" ? bounds.min : event.key === "End" ? bounds.max
+    : current + (event.key === "ArrowLeft" ? 16 : -16);
+  state.detailWidth = Math.round(Math.max(bounds.min, Math.min(bounds.max, requested)));
+  applyDetailWidth();
+  saveDetailWidth();
+}
+
+/** 只读取本来源的宽度偏好；无效或禁用的存储回到既有默认布局。 */
+function initializeDetailResize() {
+  try {
+    const saved = window.localStorage.getItem(DETAIL_WIDTH_KEY);
+    const width = saved === null || saved.trim() === "" ? NaN : Number(saved);
+    // 窄窗允许实际拖到320像素以下，读回同样接受该偏好；当前窗口边界由applyDetailWidth统一钳制。
+    if (Number.isFinite(width) && width > 0 && width <= DETAIL_MAX_WIDTH) state.detailWidth = width;
+  } catch { /* 存储不可用不影响项目读取、默认布局或后续鼠标操作。 */ }
+  for (const [type, listener] of [["pointerdown", onDetailPointerDown], ["pointermove", onDetailPointerMove],
+    ["pointerup", onDetailPointerEnd], ["pointercancel", onDetailPointerEnd], ["lostpointercapture", onDetailPointerEnd], ["keydown", onDetailResizeKey]]) {
+    ui.detailResizer.addEventListener(type, listener);
+  }
+  window.addEventListener("resize", applyDetailWidth);
+  applyDetailWidth();
 }
 
 /** 页面离开时取消计时和读取，避免留下无效的后台轮询。 */
 function onPageHide() {
+  onDetailPointerEnd({});
   state.pageInactive = true;
   invalidateSnapshotRequest();
   state.projectsRequestSerial += 1;
@@ -928,6 +1822,7 @@ function onPageShow(event) {
   if (!event.persisted) return;
   state.pageInactive = false;
   state.resizeObserver?.observe(ui.viewport);
+  state.resizeObserver?.observe(ui.timelineScroll);
   if (state.timer === null) state.timer = window.setInterval(onClockTick, 250);
   // 返回缓存后的名单也可能已变；先核验名单，暂停状态只限制随后图读取。
   state.nextProjectsRefreshAt = Date.now();
@@ -939,23 +1834,36 @@ function onPageShow(event) {
 
 /** 绑定本地页面交互并立即读取真实项目，没有自动演示回退或写接口。 */
 function initialize() {
+  initializeDetailResize();
+  try { state.overviewCollapsed = window.localStorage.getItem(OVERVIEW_KEY) === "true"; } catch { /* 存储不可用时默认展开。 */ }
+  ui.overview.addEventListener("click", onOverviewClick);
+  ui.overviewToggle.addEventListener("click", toggleOverview);
   ui.projectSelect.addEventListener("change", onProjectChange);
   ui.pause.addEventListener("click", togglePause);
   ui.fit.addEventListener("click", fitGraph);
   ui.actual.addEventListener("click", actualSize);
   ui.filters.addEventListener("click", onFilterClick);
   ui.cards.addEventListener("click", onCardClick);
+  ui.cards.addEventListener("dblclick", onCardDoubleClick);
+  ui.timelineCanvas.addEventListener("click", onTimelineClick);
+  ui.timelineCanvas.addEventListener("dblclick", onTimelineDoubleClick);
+  ui.viewSwitch.addEventListener("click", onViewClick);
+  window.addEventListener("hashchange", () => setView(viewFromHash(), false));
+  document.addEventListener("keydown", onDocumentKeydown);
   ui.details.addEventListener("click", onDetailClick);
   ui.viewport.addEventListener("wheel", onCanvasWheel, { passive: false });
   ui.viewport.addEventListener("pointerdown", onPointerDown);
   ui.viewport.addEventListener("pointermove", onPointerMove);
   ui.viewport.addEventListener("pointerup", onPointerEnd);
   ui.viewport.addEventListener("pointercancel", onPointerEnd);
+  ui.viewport.addEventListener("click", onViewportClick);
   window.addEventListener("pagehide", onPageHide);
   window.addEventListener("pageshow", onPageShow);
   state.resizeObserver = new ResizeObserver(onViewportResize);
   state.resizeObserver.observe(ui.viewport);
+  state.resizeObserver.observe(ui.timelineScroll);
   state.timer = window.setInterval(onClockTick, 250);
+  setView(viewFromHash(), false);
   renderProjects();
   void refreshProjects();
 }

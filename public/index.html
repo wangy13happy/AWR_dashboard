@@ -4,11 +4,22 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>AWR 只读依赖进度图</title>
+    <!-- 通用节点图标：矢量优先；固定尺寸图片与根路径图标供不支持矢量标签图标的浏览器使用。 -->
+    <link rel="icon" href="/favicon.ico" sizes="16x16 32x32">
+    <link rel="icon" type="image/png" href="/favicon-32.png" sizes="32x32">
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" sizes="any">
     <link rel="stylesheet" href="/styles.css">
     <script src="/vendor/dagre.js" defer></script>
     <script src="/app.js" defer></script>
   </head>
   <body>
+    <!-- 选中任务时突出连线末端的箭头；时间线关系线与依赖图高亮连线共用。 -->
+    <svg class="svg-defs" width="0" height="0" aria-hidden="true" focusable="false">
+      <defs>
+        <marker id="arrow-open" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#3f75ff"/></marker>
+        <marker id="arrow-satisfied" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#16a34a"/></marker>
+      </defs>
+    </svg>
     <header class="toolbar" aria-label="项目进度与图操作">
       <div class="project-picker">
         <label for="project-select">项目</label>
@@ -43,24 +54,55 @@
       </div>
     </header>
     <main class="workspace">
-      <section id="graph-viewport" class="graph-viewport" data-testid="graph-viewport" aria-label="依赖图：拖动画布平移，滚轮缩放，点击任务查看详情" tabindex="0">
-        <div id="graph-world" class="graph-world" data-testid="graph-world">
-          <svg id="graph-edges" class="graph-edges" aria-hidden="true"></svg>
-          <div id="graph-cards" class="graph-cards"></div>
-        </div>
+      <!-- 两个视图共用同一画布区；提示条与空态覆盖在当前视图上方，切换视图不改变它们。 -->
+      <div id="canvas-area" class="canvas-area" data-view="timeline">
+        <!-- 总览只在时间线视图显示，固定高度，可收起；依赖图视图的画布尺寸保持原样。 -->
+        <section id="overview" class="overview" data-testid="overview" aria-label="项目总览：编号分组完成率、停滞任务与近7天活动" hidden>
+          <div class="overview-bar">
+            <h2 class="overview-heading">总览</h2>
+            <span id="overview-summary" class="overview-summary" data-testid="overview-summary"></span>
+            <button type="button" id="overview-toggle" class="overview-toggle" data-testid="overview-toggle" aria-expanded="true" aria-controls="overview-body">收起</button>
+          </div>
+          <div id="overview-body" class="overview-body">
+            <div class="overview-column"><h3>编号分组完成率</h3><div id="overview-lanes" class="overview-list" data-testid="overview-lanes"></div></div>
+            <div class="overview-column"><h3 id="overview-stale-title">停滞任务</h3><div id="overview-stale" class="overview-list" data-testid="overview-stale"></div></div>
+            <div class="overview-column"><h3 id="overview-recent-title">近7天有活动</h3><div id="overview-recent" class="overview-list" data-testid="overview-recent"></div></div>
+          </div>
+        </section>
+        <section id="timeline-view" class="timeline-view" data-testid="timeline-view" aria-label="编号分组泳道时间线：每行一个编号分组，横轴为真实活动日期，单击任务查看详情，双击高亮关联任务">
+          <div id="timeline-scroll" class="timeline-scroll" data-testid="timeline-scroll" tabindex="0">
+            <div id="timeline-canvas" class="timeline-canvas" data-testid="timeline-canvas"></div>
+          </div>
+        </section>
+        <section id="graph-viewport" class="graph-viewport" data-testid="graph-viewport" aria-label="依赖图：拖动画布平移，滚轮缩放，单击任务查看详情，双击高亮关联任务" tabindex="0">
+          <div id="graph-world" class="graph-world" data-testid="graph-world">
+            <!-- 编号分组框画在连线和卡片下面，只作背景分区；只有一个分组时为空。 -->
+            <div id="graph-lanes" class="graph-lanes" data-testid="graph-lanes"></div>
+            <svg id="graph-edges" class="graph-edges" aria-hidden="true"></svg>
+            <div id="graph-cards" class="graph-cards"></div>
+          </div>
+        </section>
         <div class="banner-stack" aria-live="polite">
           <p id="project-list-banner" class="banner" data-testid="project-list-banner" hidden></p>
           <div id="banners" class="banners" data-testid="banners"></div>
         </div>
         <div id="empty-state" class="empty-state" data-testid="empty-state"><p>正在读取项目…</p></div>
-      </section>
+        <!-- 视图切换浮在画布右下角，不占用宽度已逐项固定的顶栏。 -->
+        <div class="view-switch" role="group" aria-label="视图切换" data-testid="view-switch">
+          <button type="button" data-view="timeline" aria-pressed="true" title="按编号分组的泳道时间线：横轴为真实活动日期">时间线</button>
+          <button type="button" data-view="graph" aria-pressed="false" title="依赖图：按依赖关系分层排列，每个编号分组一个框">依赖图</button>
+          <button type="button" data-view="classic" aria-pressed="false" title="改版前的依赖图：原分层坐标，不分组、无总览">旧版看板</button>
+        </div>
+      </div>
+      <div id="detail-resizer" class="detail-resizer" data-testid="detail-resizer" role="separator" aria-orientation="vertical" aria-controls="detail-panel" aria-label="调整任务详情宽度" tabindex="0" title="左右拖动调整详情宽度；方向键可微调"></div>
       <aside id="detail-panel" class="detail-panel" data-testid="detail-panel" aria-label="所选任务详情">
         <div id="detail-content"><div class="detail-empty"><p>点击任务查看详情</p><p>此看板只读，不执行或认领任务。</p></div></div>
       </aside>
     </main>
     <footer class="legend" aria-label="任务与连线图例">
       <span><i class="legend-box completed"></i>已完成</span><span><i class="legend-box in-progress"></i>进行中</span><span><i class="legend-box pending"></i>待办</span><span><i class="legend-box blocked"></i>阻塞</span><span><i class="legend-box cancelled"></i>已取消</span><span><i class="legend-box ready"></i><b class="legend-hand">☛</b>可领取（依赖已满足）</span>
-      <span><i class="legend-line satisfied"></i>依赖已满足</span><span><i class="legend-line"></i>依赖未满足</span><span><i class="legend-line optional"></i>可选依赖</span>
+      <span class="legend-graph"><i class="legend-line satisfied"></i>依赖已满足</span><span class="legend-graph"><i class="legend-line"></i>依赖未满足</span><span class="legend-graph"><i class="legend-line optional"></i>可选依赖</span><span class="legend-graph legend-grouped"><i class="legend-frame"></i>编号分组框</span>
+      <span class="legend-timeline"><i class="legend-stale"></i>进行中但超过7天无活动</span><span class="legend-timeline"><i class="legend-today"></i>今天</span><span class="legend-grouped">编号分组按编号前缀自动生成，不代表业务归属</span>
       <span id="source-label" class="source-label" data-testid="source-label">数据源：本地只读稳定副本 · 完成仅为来源声明</span>
     </footer>
   </body>

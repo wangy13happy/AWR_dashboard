@@ -61,7 +61,7 @@ try {
   const page = await browser.newPage({ viewport: { width: 2300, height: 1308 }, timezoneId: 'Asia/Shanghai' });
   const pageErrors = [];
   page.on('pageerror', error => pageErrors.push(error.message));
-  await page.goto(base);
+  await page.goto(`${base}/#view=graph`);
   await expect(page.locator('[data-node-key]')).toHaveCount(23);
   await expect(page.getByTestId('demo-badge')).toBeVisible();
   await expect(page.getByTestId('completion-label')).toContainText('6 / 22');
@@ -111,7 +111,7 @@ try {
   await expect(page.locator('[data-node-key="ND-002"]')).toHaveClass(/status-completed/, { timeout: 7500 });
   const observedRefreshMs = Date.now() - updateStarted;
   assert.equal(await scene.getAttribute('style'), transform);
-  await expect(page.getByTestId('detail-panel')).toContainText('ND-007');
+  await expect(page.locator('.detail-id code')).toHaveText('ND-007');
   passed('实际日志提交在下一轮询显示新状态，视口和所选任务不跳动');
 
   const edge = fixture.db.prepare('SELECT * FROM edges LIMIT 1').get();

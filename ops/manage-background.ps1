@@ -681,6 +681,132 @@ function Set-BackgroundTaskReadExecutePermission {
   if ($allowedCount -ne 1 -or ($remaining -join '|') -cne ($preserved -join '|')) { throw '任务权限独立读回不匹配或其他主体权限被改动，保持停用。' }
 }
 
+function ConvertFrom-BackgroundListenerSnapshot {
+  <# 仅解析完整数字地址表；未识别、截断或本地化未知状态一律保留未知，不以缺少匹配推定空闲。 #>
+  param([AllowEmptyString()][string]$Text,[Parameter(Mandatory)][ValidateRange(1,65535)][int]$Port)
+  if ([string]::IsNullOrWhiteSpace($Text) -or $Text.Length -gt 4194304) { return 'Unknown' }
+  $rows = 0
+  $headers = 0
+  $found = $false
+  $states = @('LISTENING','LISTEN','CLOSED','SYN_SENT','SYN_SEND','SYN_RECEIVED','SYN_RECV','ESTABLISHED',
+    'FIN_WAIT_1','FIN_WAIT_2','CLOSE_WAIT','CLOSING','LAST_ACK','TIME_WAIT','TIMED_WAIT','DELETE_TCB')
+  foreach ($line in ($Text -split '\r?\n')) {
+    $line = $line.Trim()
+    if (-not $line) { continue }
+    $columns = @($line -split '\s+')
+    if ($columns[0] -cnotin @('TCP','UDP')) {
+      # 只接受已知中英文标题，错误说明或其他语言不能被吞掉；无法识别时保守未知。
+      $heading = $columns -join ' '
+      $allowed = if ($headers -eq 0) { @('Active Connections','活动连接') }
+        else { @('Proto Local Address Foreign Address State PID','协议 本地地址 外部地址 状态 PID') }
+      if ($rows -gt 0 -or $headers -ge 2 -or $heading -cnotin $allowed) { return 'Unknown' }
+      $headers++
+      continue
+    }
+    $tcp = $columns[0] -ceq 'TCP'
+    if (($tcp -and $columns.Count -ne 5) -or (-not $tcp -and $columns.Count -ne 4)) { return 'Unknown' }
+    [uint32]$processNumber = 0
+    if ($columns[-1] -notmatch '^\d+$' -or -not [uint32]::TryParse($columns[-1],[ref]$processNumber)) { return 'Unknown' }
+    $localPort = -1
+    foreach ($index in @(1,2)) {
+      if (-not $tcp -and $index -eq 2 -and $columns[$index] -ceq '*:*') { continue }
+      $endpoint = [regex]::Match($columns[$index], '^(?:\[(?<address>[^\]]+)\]|(?<address>[^:]+)):(?<port>[0-9]+)$')
+      [Net.IPAddress]$address = $null
+      [int]$number = 0
+      if (-not $endpoint.Success -or -not [Net.IPAddress]::TryParse($endpoint.Groups['address'].Value,[ref]$address) -or
+          -not [int]::TryParse($endpoint.Groups['port'].Value,[ref]$number) -or $number -gt 65535) { return 'Unknown' }
+      if ($index -eq 1) { $localPort = $number }
+    }
+    $rows++
+    if ($tcp -and $localPort -eq $Port) {
+      # 其他端口的未知状态不影响本端口；目标端口则必须有明确、受支持的状态。
+      if ($columns[3] -cnotin $states) { return 'Unknown' }
+      if ($columns[3] -cin @('LISTENING','LISTEN')) { $found = $true }
+    }
+  }
+  if ($rows -eq 0) { return 'Unknown' }
+  if ($found) { return 'Present' }
+  return 'Absent'
+}
+
+function Get-BackgroundPortObservation {
+  <# 在自有隐藏观察进程中读取真实TCP监听；预算到期或查询失败保持未知，绝不当作端口空闲。 #>
+  param([Parameter(Mandatory)][ValidateRange(1,65535)][int]$Port)
+  $watch = [Diagnostics.Stopwatch]::StartNew()
+  $observation = [pscustomobject]@{State='Unknown';Reason='ObserverFailure';ObserverProcessId=$null;
+    ObserverStarted=$false;ObserverExited=$false;ElapsedMilliseconds=0}
+  $observer = [Diagnostics.Process]::new()
+  try {
+    # 固定系统工具避免PowerShell/网络模块冷启动；-ano同时包含IPv4与IPv6且不解析名称，不加载额外程序。
+    $observer.StartInfo = [Diagnostics.ProcessStartInfo]::new()
+    $observer.StartInfo.FileName = Join-Path ([Environment]::GetFolderPath('Windows')) 'System32\netstat.exe'
+    $observer.StartInfo.Arguments = '-ano'
+    $observer.StartInfo.WorkingDirectory = [Environment]::GetFolderPath('Windows')
+    $observer.StartInfo.UseShellExecute = $false
+    $observer.StartInfo.CreateNoWindow = $true
+    $observer.StartInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+    $observer.StartInfo.RedirectStandardOutput = $true
+    $observer.StartInfo.RedirectStandardError = $true
+    # netstat重定向文本仍使用本地OEM代码页；不能继承调用方为JSON设定的UTF-8而损坏中文表头。
+    $observer.StartInfo.StandardOutputEncoding = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
+    $observer.StartInfo.StandardErrorEncoding = $observer.StartInfo.StandardOutputEncoding
+    if (-not $observer.Start()) { throw '监听观察进程未创建。' }
+    $observation.ObserverStarted = $true
+    $observation.ObserverProcessId = $observer.Id
+    # 两个流并发排空，避免工具被满管道阻塞；不把整机连接表写入日志或返回给调用者。
+    $stdout = $observer.StandardOutput.ReadToEndAsync()
+    $stderr = $observer.StandardError.ReadToEndAsync()
+    # 3秒预算包含准备与创建耗时；Process.Start为同步系统调用，不能承诺资源饥饿时整段严格墙钟上限。
+    $remaining = [Math]::Max(0,3000-[int]$watch.ElapsedMilliseconds)
+    if ($observer.WaitForExit($remaining) -and $observer.HasExited) {
+      $observation.ObserverExited = $true
+      # 创建或父线程恢复调度可能已超过预算；晚到结果即使退出码有效也不能倒推为期限内观测成功。
+      if ($watch.ElapsedMilliseconds -gt 3000) { $observation.Reason='Timeout' }
+      else {
+        $remaining = [Math]::Max(0,3000-[int]$watch.ElapsedMilliseconds)
+        $readComplete = [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($stdout,$stderr),$remaining)
+        if (-not $readComplete -or $watch.ElapsedMilliseconds -gt 3000) { $observation.Reason='Timeout' }
+        elseif ($observer.ExitCode -ne 0 -or -not [string]::IsNullOrWhiteSpace($stderr.Result)) { $observation.Reason='QueryFailed' }
+        else {
+          $state = ConvertFrom-BackgroundListenerSnapshot -Text $stdout.Result -Port $Port
+          # 解析也计入预算，不能将晚到结果追认为期限内成功。
+          if ($watch.ElapsedMilliseconds -gt 3000) { $observation.Reason='Timeout' }
+          elseif ($state -eq 'Unknown') { $observation.Reason='InvalidResponse' }
+          else { $observation.State=$state; $observation.Reason='Observed' }
+        }
+      }
+    } else { $observation.Reason='Timeout' }
+  } catch { $observation.State='Unknown'; $observation.Reason='ObserverFailure' }
+  finally {
+    if ($observation.ObserverStarted -and -not $observation.ObserverExited) {
+      # 只操作本次持有的进程对象，不按编号重开或扫描；取消后另给1秒核验退出，失败不能宣称已收尾。
+      try {
+        if (-not $observer.HasExited) { $observer.Kill() }
+        $observation.ObserverExited = ($observer.WaitForExit(1000) -and $observer.HasExited)
+      } catch { $observation.ObserverExited=$false }
+      if (-not $observation.ObserverExited) { $observation.State='Unknown'; $observation.Reason='ObserverCleanupFailed' }
+    }
+    $observer.Dispose()
+    $observation.ElapsedMilliseconds = $watch.ElapsedMilliseconds
+    $watch.Stop()
+  }
+  return $observation
+}
+
+function Complete-BackgroundStartFailure {
+  <# 保留最初错误记录及位置，附加收尾事实；安装/启用包裹启动时，同一次失败只尝试收尾一次。 #>
+  param([Parameter(Mandatory)]$Configuration,[Parameter(Mandatory)][Management.Automation.ErrorRecord]$Failure)
+  $key = 'AwrDashboard.FailedRunCleanup'
+  if (-not $Failure.Exception.Data.Contains($key)) {
+    $Failure.Exception.Data[$key] = $true
+    try { $cleanup = Stop-BackgroundFailedRun $Configuration }
+    catch { $cleanup = '失败安全收尾：停用读回=False；无实例读回=False；问题=收尾异常，状态无法确认。' }
+    $original = if ($Failure.ErrorDetails -and $Failure.ErrorDetails.Message) { $Failure.ErrorDetails.Message } else { $Failure.Exception.Message }
+    $Failure.ErrorDetails = [Management.Automation.ErrorDetails]::new($original + ' ' + $cleanup)
+  }
+  throw $Failure
+}
+
 function Stop-BackgroundFailedRun {
   <# 失败后仅停用/停止仍归属明确的登录任务并独立读回，不重装旧链、不猜测或结束外来进程。 #>
   param([Parameter(Mandatory)]$Configuration)
@@ -688,7 +814,10 @@ function Stop-BackgroundFailedRun {
   $task = $null
   try { $task = Get-OwnedBackgroundTask $Configuration } catch { $errors.Add('任务归属读回失败，未处理同名未知任务') }
   if ($task) {
-    if ((Get-BackgroundTaskDefinitionKind $Configuration $task) -ne 'Login') { $errors.Add('任务已不是登录定义，未处理旧链') }
+    $kind = $null
+    try { $kind = Get-BackgroundTaskDefinitionKind $Configuration $task }
+    catch { $errors.Add('任务定义读回失败，未处理定义未知任务') }
+    if ($kind -ne 'Login') { $errors.Add('任务已不是确认的登录定义，未处理旧链或未知任务') }
     else {
       try { $null=Disable-ScheduledTask -TaskPath $Configuration.TaskPath -TaskName $Configuration.TaskName -ErrorAction Stop }
       catch { $errors.Add('停用失败') }
@@ -701,15 +830,21 @@ function Stop-BackgroundFailedRun {
   }
   $disabled = $false
   $stopped = $false
+  $portState = 'Unknown'
+  $portReason = 'NotObserved'
   try {
     $status = Get-BackgroundStatus $Configuration
     $disabled = (-not $status.Installed -or -not $status.Enabled)
     $instances = if ($status.Installed) { Get-BackgroundTaskInstanceCount $Configuration } else { 0 }
-    $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object { $_.LocalPort -eq $Configuration.Port })
-    $stopped = ($status.TaskState -notin @('Running','Queued') -and $instances -eq 0 -and $listeners.Count -eq 0 -and
+    $observation = Get-BackgroundPortObservation -Port $Configuration.Port
+    $portState = $observation.State
+    $portReason = $observation.Reason
+    if ($portState -eq 'Unknown' -or -not $observation.ObserverExited) { $errors.Add('监听状态无法确认') }
+    # 明确观测为无监听且自有观察者已退出，才允许与其他独立读回共同形成无实例结论。
+    $stopped = ($status.TaskState -notin @('Running','Queued') -and $instances -eq 0 -and $portState -eq 'Absent' -and $observation.ObserverExited -and
       $null -eq $status.ManagedProcessId -and -not $status.RuntimeRecordError)
   } catch { $errors.Add('状态读回失败') }
-  return ('失败安全收尾：停用读回={0}；无实例读回={1}；问题={2}。' -f $disabled,$stopped,($errors -join '、'))
+  return ('失败安全收尾：停用读回={0}；无实例读回={1}；端口观测={2}/{3}；问题={4}。' -f $disabled,$stopped,$portState,$portReason,($errors -join '、'))
 }
 
 function Assert-BackgroundLoginEnableReady {
@@ -772,9 +907,7 @@ function Start-BackgroundInstance {
     } while ([DateTime]::UtcNow -lt $deadline)
     throw '看板未在15秒内成为可核对的健康登录实例；请查看run/background/startup-failure.json及service.log。'
   } catch {
-    $failure = $_.Exception.Message
-    $cleanup = Stop-BackgroundFailedRun $Configuration
-    throw ($failure + ' ' + $cleanup)
+    Complete-BackgroundStartFailure -Configuration $Configuration -Failure $_
   }
 }
 
@@ -874,9 +1007,7 @@ function Invoke-BackgroundManagement {
         $null = Enable-ScheduledTask -TaskPath $configuration.TaskPath -TaskName $configuration.TaskName -ErrorAction Stop
         return Start-BackgroundInstance $configuration -RequireScheduledRun
       } catch {
-        $failure=$_.Exception.Message
-        $cleanup=Stop-BackgroundFailedRun $configuration
-        throw ($failure + ' ' + $cleanup)
+        Complete-BackgroundStartFailure -Configuration $configuration -Failure $_
       }
     }
     'Start' { return Start-BackgroundInstance $configuration }
@@ -899,9 +1030,7 @@ function Invoke-BackgroundManagement {
         $null = Enable-ScheduledTask -TaskName $configuration.TaskName -TaskPath $configuration.TaskPath -ErrorAction Stop
         return Start-BackgroundInstance $configuration
       } catch {
-        $failure=$_.Exception.Message
-        $cleanup=Stop-BackgroundFailedRun $configuration
-        throw ($failure + ' ' + $cleanup)
+        Complete-BackgroundStartFailure -Configuration $configuration -Failure $_
       }
     }
     'Uninstall' {
@@ -921,5 +1050,5 @@ if ($MyInvocation.InvocationName -ne '.') {
   try {
     $result = Invoke-BackgroundManagement $Action
     if ($Action -eq 'Prepare') { Write-Output $result } else { $result | ConvertTo-Json -Depth 4 }
-  } catch { Write-Error $_.Exception.Message; exit 1 }
+  } catch { Write-Error -ErrorRecord $_; exit 1 }
 }

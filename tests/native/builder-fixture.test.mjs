@@ -7,11 +7,11 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { NATIVE_POWERSHELL, nativePowerShellEnvironment, nativeSkipReason, writeNativeFixtureBinding } from './native-test-support.mjs';
 
 const ROOT = fileURLToPath(new URL('../../', import.meta.url)).replace(/[\\/]$/, '');
-const POWERSHELL = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+const POWERSHELL = NATIVE_POWERSHELL;
 const execute = promisify(execFile);
-const windows = process.platform === 'win32';
 const APPROVED_DUMP = 'Magic 010b (PE32)\nEntry d 00000000 00000000 Delay Import Directory\n DLL Name: KERNEL32.dll\n DLL Name: ADVAPI32.dll\n DLL Name: msvcrt.dll';
 const PUBLISHED = ['background-launcher.exe', 'build-receipt.json', 'source-manifest.json'];
 const SYNTHETIC_C = `#define WIN32_LEAN_AND_MEAN
@@ -70,11 +70,13 @@ async function fixture(t) {
     build: path.join(project, 'run', 'background-launcher-build'),
   };
   // 历史构建器仍加载当前管理器预检；补齐固定隐藏包装输入，但夹具禁止执行它或操作真实任务。
-  for (const relative of ['ops/build-background-launcher.ps1', 'ops/manage-background.ps1', 'ops/background-settings.json', 'ops/start-background-hidden.vbs']) {
+  for (const relative of ['ops/build-background-launcher.ps1', 'ops/manage-background.ps1', 'ops/start-background-hidden.vbs']) {
     const target = path.join(project, relative);
     assertScopedPath(directory, target);
     await writeFile(target, await readFile(path.join(ROOT, relative)), { flag: 'wx' });
   }
+  // 干净克隆没有本机绑定；由已跟踪示例生成本夹具自己的配置，正式源配置始终不参与测试。
+  await writeNativeFixtureBinding(ROOT, directory, project);
   await writeFile(paths.source, SYNTHETIC_C, { flag: 'wx' });
   await writeFile(paths.runner, 'throw new Error("合成入口不得执行");\n', { flag: 'wx' });
   await writeFile(paths.registry, '{"version":1,"defaultProjectId":null,"projects":[]}\n', { flag: 'wx' });
@@ -98,8 +100,7 @@ function Start-Process { <# 除固定编译器/检查工具的直接调用，不
 . ${literal(options.builder)}
 ${body}`;
   // Node由PowerShell7启动时可能继承其模块搜索路径；只调整本测试子进程，不能全局修改环境。
-  const environment = { ...process.env };
-  for (const name of Object.keys(environment)) if (name.toLowerCase() === 'psmodulepath') delete environment[name];
+  const environment = nativePowerShellEnvironment();
   try {
     return await execute(POWERSHELL, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
       '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')],
@@ -158,7 +159,9 @@ Set-Item -LiteralPath 'Function:\\C:\\MinGW\\bin\\objdump.exe' -Value {
 `;
 }
 
-test('G2构建器隔离联测：四源清单、完整绑定、32位系统导入与重复发布', { skip: !windows }, async t => {
+test('G2构建器隔离联测：四源清单、完整绑定、32位系统导入与重复发布', async t => {
+  const unavailable = await nativeSkipReason({ builder: true });
+  if (unavailable) { t.skip(unavailable); return; }
   const options = await fixture(t);
   const first = await build(options);
   const manifestPath = path.join(options.build, 'source-manifest.json');
@@ -198,7 +201,10 @@ test('G2构建器隔离联测：四源清单、完整绑定、32位系统导入�
     compiledArtifactExecuted: false, taskOperations: false }));
 });
 
-test('G2构建器不提供路径/命令/账户覆盖参数，拒绝发生在任何构建写入之前', { skip: !windows }, async t => {
+test('G2构建器不提供路径/命令/账户覆盖参数，拒绝发生在任何构建写入之前', async t => {
+  // 这里只解析和拒绝参数，不执行构建；不能因为机器没有编译器而放弃该断言。
+  const unavailable = await nativeSkipReason({ powerShell: true });
+  if (unavailable) { t.skip(unavailable); return; }
   const options = await fixture(t);
   for (const name of ['NodePath', 'ProjectRoot', 'UserSid', 'Command']) {
     const result = await powershell(options, `
@@ -215,7 +221,9 @@ $ast=[Management.Automation.Language.Parser]::ParseFile(${literal(options.builde
     declaredParameters: 0, buildDirectoryCreated: false, compiledArtifactExecuted: false, taskOperations: false }));
 });
 
-test('G2构建期间合成C变化拒绝发布，旧程序/清单/收据原字节保留', { skip: !windows }, async t => {
+test('G2构建期间合成C变化拒绝发布，旧程序/清单/收据原字节保留', async t => {
+  const unavailable = await nativeSkipReason({ builder: true });
+  if (unavailable) { t.skip(unavailable); return; }
   const options = await fixture(t);
   await build(options);
   const before = await publishedBytes(options);
@@ -237,7 +245,9 @@ try { $null=Invoke-LauncherBuild } catch { $rejected=$true; $message=$_.Exceptio
     sourceChanged: true, pendingPreserved: true, compiledArtifactExecuted: false, taskOperations: false }));
 });
 
-test('G2构建器拒绝不允许导入、延迟导入及未知结构，不覆盖旧发布', { skip: !windows }, async t => {
+test('G2构建器拒绝不允许导入、延迟导入及未知结构，不覆盖旧发布', async t => {
+  const unavailable = await nativeSkipReason({ builder: true });
+  if (unavailable) { t.skip(unavailable); return; }
   const options = await fixture(t);
   await build(options);
   const before = await publishedBytes(options);

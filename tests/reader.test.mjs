@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, writeFile, unlink, open, readdir, symlink, mkdir, mkdtemp, realpath, lstat, rm } from 'node:fs/promises';
+import { readFile, writeFile, unlink, open, readdir, symlink, mkdir, mkdtemp, realpath, lstat, rm, utimes } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { readSnapshot } from '../src/reader.js';
@@ -12,6 +12,14 @@ async function fixtureFor(t, options) {
   const fixture = await createReaderFixture(options);
   t.after(() => fixture.dispose());
   return fixture;
+}
+
+/** 源文件或注入时刻不变数据库 size。要强制重新捕获时，只把 state.db 的 mtime 向前拨 1 秒。 */
+async function bumpDatabaseStamp(root) {
+  const filename = path.join(root, '.awr', 'state.db');
+  const info = await lstat(filename);
+  const next = new Date(Number(info.mtimeMs) + 1000);
+  await utimes(filename, next, next);
 }
 
 /** 以安全工作键查节点，测试不用数组顺序猜节点身份。 */
@@ -35,7 +43,7 @@ function errorCode(code, retryable) {
 test('完整共享契约、载荷优先及所有字段可序列化', async (t) => {
   const fixture = await fixtureFor(t, { works: [{ key: 'A', status: 'ready', columnStatus: 'blocked', columnTitle: 'Wrong convenience column' }] });
   const snapshot = await readSnapshot(fixture.root, { now: 1000 });
-  assert.deepEqual(Object.keys(snapshot).sort(), ['version', 'project', 'revision', 'sourceFingerprint', 'updatedAt', 'evaluatedAt', 'readOnly', 'mode', 'sources', 'nodes', 'edges', 'counts', 'diagnostics'].sort());
+  assert.deepEqual(Object.keys(snapshot).sort(), ['version', 'project', 'revision', 'sourceFingerprint', 'updatedAt', 'evaluatedAt', 'readOnly', 'mode', 'sources', 'nodes', 'edges', 'counts', 'diagnostics', 'lanes'].sort());
   assert.equal(snapshot.evaluatedAt, 1000);
   assert.equal(snapshot.mode, 'live');
   assert.equal(snapshot.readOnly, true);
@@ -240,6 +248,7 @@ test('仅台账字节变化/缺失使旧投影过期，没有源重索引', asyn
   const fixture = await fixtureFor(t);
   const first = await readSnapshot(fixture.root);
   await writeFile(path.join(fixture.root, 'ledger.yaml'), 'work_items: []\n# unindexed change\n');
+  await bumpDatabaseStamp(fixture.root);
   const before = await fixtureFileBaseline(fixture.root);
   const stale = await readSnapshot(fixture.root);
   assert.notEqual(stale.sourceFingerprint, first.sourceFingerprint);
@@ -248,6 +257,7 @@ test('仅台账字节变化/缺失使旧投影过期，没有源重索引', asyn
   assert.equal(node(stale, 'A').waiting, true);
   assert.deepEqual(await fixtureFileBaseline(fixture.root), before);
   await unlink(path.join(fixture.root, 'ledger.yaml'));
+  await bumpDatabaseStamp(fixture.root);
   const missing = await readSnapshot(fixture.root);
   assert.equal(missing.sources.find((source) => source.id === fixture.sourceRows.get('ledger').id).freshness, 'missing');
   assert.equal(node(missing, 'A').ready, false);
@@ -357,8 +367,10 @@ test('新增未索引注册、未核验 Git、越界来源均 fail closed 且不
   assert.equal(added.counts.ready, 0);
   assert.ok(added.diagnostics.some((item) => item.code === 'source_registry_unverified'));
   await writeFile(manifestPath, fixture.manifest.replace('path = "ledger.yaml"', 'locator = "git://HEAD:ledger.yaml"'));
+  await bumpDatabaseStamp(fixture.root);
   assert.equal((await readSnapshot(fixture.root)).counts.ready, 0);
   await writeFile(manifestPath, fixture.manifest.replace('path = "ledger.yaml"', 'path = "../outside.yaml"'));
+  await bumpDatabaseStamp(fixture.root);
   assert.equal((await readSnapshot(fixture.root)).counts.ready, 0);
 });
 
@@ -465,6 +477,7 @@ test('独立边来源字节漂移阻止领取，节点来源没有漂移也不�
   ], works: [{ key: 'A', status: 'completed' }, { key: 'B', status: 'ready' }], edges: [{ from: 'B', to: 'A', source: 'edges' }] });
   assert.equal(node(await readSnapshot(fixture.root), 'B').ready, true);
   await writeFile(path.join(fixture.root, 'edges.yaml'), '# unindexed edge change');
+  await bumpDatabaseStamp(fixture.root);
   const changed = await readSnapshot(fixture.root);
   assert.equal(changed.edges[0].satisfied, false);
   assert.equal(node(changed, 'B').ready, false);
@@ -478,6 +491,7 @@ test('跨分支且会话已结束的 active claim 仍占用，严格等于到期
   assert.equal(node(before, 'A').ready, false);
   assert.equal(node(before, 'A').continuable, true);
   assert.equal(node(before, 'A').waiting, false);
+  await bumpDatabaseStamp(fixture.root);
   const atExpiry = await readSnapshot(fixture.root, { now: 100 });
   assert.equal(before.revision, atExpiry.revision);
   assert.equal(node(atExpiry, 'A').claims.length, 0);
@@ -588,13 +602,16 @@ test('不读证据目标，不读注册的.env/密钥文件；大源/坏TOML均�
   const fixture = await fixtureFor(t, { evidence: [{ key: 'A', locator: 'nonexistent-secret-file.pem' }] });
   assert.equal(node(await readSnapshot(fixture.root), 'A').evidence[0].locator, 'nonexistent-secret-file.pem');
   await writeFile(path.join(fixture.root, '.awr', 'project.toml'), fixture.manifest.replace('path = "ledger.yaml"', 'path = ".env"'));
+  await bumpDatabaseStamp(fixture.root);
   assert.equal((await readSnapshot(fixture.root)).counts.ready, 0);
   await writeFile(path.join(fixture.root, '.awr', 'project.toml'), fixture.manifest);
   const handle = await open(path.join(fixture.root, 'ledger.yaml'), 'w');
   await handle.truncate(8 * 1024 * 1024 + 1);
   await handle.close();
+  await bumpDatabaseStamp(fixture.root);
   assert.equal((await readSnapshot(fixture.root)).sources.find((source) => source.id === fixture.sourceRows.get('ledger').id).freshness, 'unverified');
   await writeFile(path.join(fixture.root, '.awr', 'project.toml'), 'broken = [');
+  await bumpDatabaseStamp(fixture.root);
   assert.equal((await readSnapshot(fixture.root)).counts.ready, 0);
 });
 

@@ -3,6 +3,7 @@ import { lstat, realpath, open } from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { DashboardError, hasSensitiveContent } from './safety.js';
+import { validLaneOverrides } from './lanes.js';
 
 const REGISTRY_LIMIT = 64 * 1024;
 const PROJECT_LIMIT = 1000;
@@ -63,13 +64,16 @@ function registryValue(bytes) {
   const ids = new Set();
   const projects = value.projects.map((project) => {
     if (!project || typeof project !== 'object' || Array.isArray(project)
-      || Object.keys(project).some((key) => !['id', 'name', 'root'].includes(key))
+      || Object.keys(project).some((key) => !['id', 'name', 'root', 'lanes'].includes(key))
       || !isRegisteredProjectId(project.id) || ids.has(project.id)
       || typeof project.name !== 'string' || !project.name.trim() || project.name.length > 200
       || typeof project.root !== 'string' || project.root.length > 4096 || !path.isAbsolute(project.root)
       || /[\u0000-\u001f\u007f]/.test(project.name + project.root)) throw registryError();
+    // 可选编号分组覆盖只属于本看板展示，不写入也不要求被查看项目声明任何分类。
+    const lanes = validLaneOverrides(project.lanes);
+    if (lanes === null) throw registryError();
     ids.add(project.id);
-    return { id: project.id, name: project.name, root: project.root };
+    return { id: project.id, name: project.name, root: project.root, ...(project.lanes === undefined ? {} : { lanes }) };
   });
   return { version: 1, defaultProjectId: ids.has(value.defaultProjectId) ? value.defaultProjectId : null,
     projects, fingerprint: createHash('sha256').update(bytes).digest('hex') };

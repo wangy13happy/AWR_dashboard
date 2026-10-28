@@ -80,6 +80,7 @@ async function beginMeasurement(page, scrollPosition) {
       frame = requestAnimationFrame(sample);
     };
     const started = performance.now();
+    window.__topMeasurementStarted = started;
     frame = requestAnimationFrame(sample);
     window.__finishTopMeasurement = () => {
       cancelAnimationFrame(frame);
@@ -106,11 +107,15 @@ async function openScenario(base, width, scrollPosition) {
   page.on('response', response => {
     if (response.url().includes('/api/snapshot')) scenario.responses.push({ at: Date.now(), status: response.status() });
   });
-  await page.goto(base);
+  await page.goto(`${base}/#view=graph`);
   await expect(page.locator('[data-node-key]')).toHaveCount(23);
   await expect(page.locator('#refresh-label')).toContainText('每 5s 刷新');
   await beginMeasurement(page, scrollPosition);
-  await page.screenshot({ path: path.join(output, `${name}-idle.png`), clip: { x: 0, y: 0, width, height: 40 } });
+  // 页面建立与首次读回可能已跨过一个轮询点；只把开始逐帧测量后的响应计入三次周期。
+  scenario.responsesAtMeasurement = scenario.responses.length;
+  // 顶栏高度可随已授权可读性样式调整；截图覆盖真实完整顶栏，几何断言不变。
+  const toolbarHeight = await page.locator('.toolbar').evaluate(node => node.getBoundingClientRect().height);
+  await page.screenshot({ path: path.join(output, `${name}-idle.png`), clip: { x: 0, y: 0, width, height: toolbarHeight } });
   return { page, scenario };
 }
 
@@ -137,9 +142,13 @@ try {
   await Promise.all(scenarios.map(async ({ page, scenario }) => {
     await expect.poll(() => scenario.requests.length, { timeout: 18000 }).toBeGreaterThanOrEqual(2);
     await expect(page.locator('#refresh-label')).toHaveText('正在读取');
-    await page.screenshot({ path: path.join(output, `${scenario.name}-loading.png`), clip: { x: 0, y: 0, width: scenario.width, height: 40 } });
-    await expect.poll(() => scenario.responses.length, { timeout: 18000 }).toBeGreaterThanOrEqual(4);
+    const toolbarHeight = await page.locator('.toolbar').evaluate(node => node.getBoundingClientRect().height);
+    await page.screenshot({ path: path.join(output, `${scenario.name}-loading.png`), clip: { x: 0, y: 0, width: scenario.width, height: toolbarHeight } });
+    await expect.poll(() => scenario.responses.length, { timeout: 23000 })
+      .toBeGreaterThanOrEqual(scenario.responsesAtMeasurement + 3);
     await expect(page.locator('#refresh-label')).toContainText('每 5s 刷新');
+    // 保留原14秒下限，以真实浏览器单调时钟确认窗口；不靠重试偶然撞上较长起点。
+    await page.waitForFunction(() => performance.now() - window.__topMeasurementStarted >= 14000);
     scenario.measurement = await page.evaluate(() => window.__finishTopMeasurement());
   }));
   report.scenarios = scenarios.map(({ scenario }) => scenario);

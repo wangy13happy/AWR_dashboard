@@ -84,7 +84,7 @@ try {
   browser = await chromium.launch({ channel: 'chrome', headless: true });
   page = await browser.newPage({ viewport: { width: 2300, height: 1308 }, timezoneId: 'Asia/Shanghai' });
   page.on('pageerror', error => pageErrors.push(error.message));
-  await page.goto(base);
+  await page.goto(`${base}/#view=graph`);
   await expect(page.locator('[data-node-key]')).toHaveCount(23);
   await page.locator('[data-node-key="ND-007"]').click();
   await expect(page.getByTestId('detail-panel')).toContainText('景区商圈车辆到访分析');
@@ -104,7 +104,7 @@ try {
     assert.ok(value.graphWidth >= (viewport.width === 2300 ? 1840 : viewport.width === 1366 ? 1000 : 640));
     assert.deepEqual([value.bodyFont, value.bodyLineHeight, value.titleFont, value.sectionFont,
       value.dependencyFont, value.evidenceFont, value.metadataFont, value.auxiliaryFont, value.claimFont],
-    [14, 24, 18, 13, 13, 13, 12, 12, 12]);
+    [14, 24, 22, 15, 13, 13, 12, 12, 12]);
     await capture(`sidebar-layout-${viewport.width}`);
     passed(`${viewport.width}×${viewport.height}实测侧栏${value.sidebarWidth}px、正文14px/24px且画布和页面无横向溢出`);
   }
@@ -178,7 +178,7 @@ try {
   await expect(page.getByTestId('detail-panel')).toContainText('点击任务查看详情');
   const otherPage = await browser.newPage({ viewport: { width: 1366, height: 768 } });
   otherPage.on('pageerror', error => pageErrors.push(error.message));
-  await otherPage.goto(base);
+  await otherPage.goto(`${base}/#view=graph`);
   await expect(otherPage.getByTestId('project-select')).toHaveValue('a');
   await expect(otherPage.locator('[data-node-key]')).toHaveCount(23);
   await expect(page.getByTestId('project-select')).toHaveValue('b');

@@ -62,7 +62,7 @@ function requestIsLocal(request, port) {
  * 创建登记或固定项目的只读服务。网页只能传登记标识，不能提供任意文件路径。
  * 服务不后台遍历项目；名单不读数据库，只有所选项目请求会读取稳定副本。
  */
-export function createDashboardServer({ registryPath, projectRoot, snapshotReader = readSnapshot, publicDirectory, onError = () => {} }) {
+export function createDashboardServer({ registryPath, projectRoot, snapshotReader = readSnapshot, publicDirectory, onError = () => {}, agentObserver = null }) {
   const registryMode = registryPath !== undefined;
   if (!registryMode && typeof projectRoot !== 'string') throw new DashboardError('PROJECT_UNAVAILABLE');
   const staticRoot = publicDirectory ?? path.join(WORKSPACE, 'public');
@@ -72,6 +72,10 @@ export function createDashboardServer({ registryPath, projectRoot, snapshotReade
     ['/index.html', [path.join(staticRoot, 'index.html'), 'text/html; charset=utf-8']],
     ['/styles.css', [path.join(staticRoot, 'styles.css'), 'text/css; charset=utf-8']],
     ['/app.js', [path.join(staticRoot, 'app.js'), 'text/javascript; charset=utf-8']],
+    // 图标仍使用精确白名单；静态请求不读取项目，也不开放任意文件或目录。
+    ['/favicon.svg', [path.join(staticRoot, 'favicon.svg'), 'image/svg+xml']],
+    ['/favicon-32.png', [path.join(staticRoot, 'favicon-32.png'), 'image/png']],
+    ['/favicon.ico', [path.join(staticRoot, 'favicon.ico'), 'image/x-icon']],
     ['/vendor/dagre.js', [path.join(WORKSPACE, 'node_modules/@dagrejs/dagre/dist/dagre.min.js'), 'text/javascript; charset=utf-8']],
   ]);
   const inFlight = new Map();
@@ -113,7 +117,8 @@ export function createDashboardServer({ registryPath, projectRoot, snapshotReade
   function obtainSnapshot(entry, registryRevision) {
     const key = JSON.stringify([entry.id, registryRevision]);
     if (!inFlight.has(key)) {
-      const read = Promise.resolve().then(() => snapshotReader(entry.root)).finally(() => {
+      const read = Promise.resolve().then(() => snapshotReader(entry.root, { agentObservationProvider: () => agentObserver?.latest() ?? null,
+        laneOverrides: entry.lanes ?? null })).finally(() => {
         if (inFlight.get(key) === read) inFlight.delete(key);
       });
       inFlight.set(key, read);
@@ -219,5 +224,9 @@ export function createDashboardServer({ registryPath, projectRoot, snapshotReade
   server.requestTimeout = 15_000;
   server.headersTimeout = 10_000;
   server.keepAliveTimeout = 5_000;
+  // 入口显式传入服务专属观察器；库级夹具不隐式扫描全机，服务关闭即清空并结束探针。
+  server.agentObserverStopped = Promise.resolve();
+  server.once('listening', () => agentObserver?.start());
+  server.once('close', () => { server.agentObserverStopped = agentObserver?.stop() ?? Promise.resolve(); });
   return server;
 }

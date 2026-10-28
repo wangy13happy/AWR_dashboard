@@ -104,7 +104,7 @@ try {
   page = await browser.newPage({ viewport: { width: 2300, height: 1308 }, timezoneId: 'Asia/Shanghai' });
   page.on('pageerror', error => pageErrors.push(error.message));
   page.on('response', response => { if (new URL(response.url()).pathname === '/api/projects') listResponses += 1; });
-  await page.goto(base);
+  await page.goto(`${base}/#view=graph`);
   const select = page.getByTestId('project-select');
   await expect(select).toHaveValue('a');
   await expect(page.locator('[data-node-key]')).toHaveCount(2);
@@ -133,7 +133,7 @@ try {
   await expect(page.getByTestId('project-name')).toHaveText('项目B');
   const otherPage = await browser.newPage({ viewport: { width: 1366, height: 768 } });
   otherPage.on('pageerror', error => pageErrors.push(error.message));
-  await otherPage.goto(base);
+  await otherPage.goto(`${base}/#view=graph`);
   await expect(otherPage.getByTestId('project-select')).toHaveValue('a');
   await expect(otherPage.getByTestId('project-name')).toHaveText('项目A');
   await expect(select).toHaveValue('b');
